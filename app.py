@@ -205,8 +205,26 @@ def build_trade_chart(data, trades=None, show_levels=True):
         x=x["datetime"], open=x["open"], high=x["high"], low=x["low"], close=x["close"],
         name="NIFTY 50", increasing_line_color="#089981",
         increasing_fillcolor="#089981", decreasing_line_color="#F23645",
-        decreasing_fillcolor="#F23645", whiskerwidth=0.7
+        decreasing_fillcolor="#F23645", whiskerwidth=0.85,
+        hovertemplate=(
+            "<b>%{x|%d %b %Y %H:%M}</b><br>"
+            "O: %{open:.2f}<br>H: %{high:.2f}<br>"
+            "L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"
+        )
     )])
+    # Fixed corner readout shows the most recent candle; hover reveals OHLC
+    # for the candle under the cursor in the chart tooltip.
+    last = x.iloc[-1]
+    last_color = "#089981" if float(last.close) >= float(last.open) else "#F23645"
+    fig.add_annotation(
+        x=0.012, y=0.985, xref="paper", yref="paper",
+        xanchor="left", yanchor="top", showarrow=False,
+        text=(f"O {last.open:,.2f}   H {last.high:,.2f}   "
+              f"L {last.low:,.2f}   C {last.close:,.2f}"),
+        font=dict(color=last_color, size=11, family="Arial"),
+        bgcolor="rgba(255,255,255,0.88)", bordercolor="#E0E3EB",
+        borderwidth=1, borderpad=5
+    )
 
     if show_levels:
         levels = build_signals(x)
@@ -283,11 +301,14 @@ def build_trade_chart(data, trades=None, show_levels=True):
         margin=dict(l=12, r=70, t=35, b=35),
         hovermode="x unified",
         dragmode="pan",
+        hoverdistance=35,
+        spikedistance=-1,
         showlegend=False,
         uirevision="nql_tradingview_chart",
         xaxis=dict(
             title="", type="date", side="bottom",
             rangeslider=dict(visible=False), fixedrange=False,
+            autorange=True, constrain="domain",
             showgrid=True, gridcolor="#E6E8EB", zeroline=False,
             showline=True, linecolor="#D1D4DC",
             tickfont=dict(color="#434651"),
@@ -300,6 +321,7 @@ def build_trade_chart(data, trades=None, show_levels=True):
         ),
         yaxis=dict(
             title="", side="right", fixedrange=False,
+            autorange=True,
             showgrid=True, gridcolor="#E6E8EB", zeroline=False,
             showline=True, linecolor="#D1D4DC",
             tickfont=dict(color="#434651"),
@@ -1241,6 +1263,7 @@ if setup_mode == "Test one setup individually":
 else:
     active_setups = None
 st.caption("Each run permits exactly one trade per trading day. Individual setup runs are independent; the same date may trade in separate setup experiments.")
+st.markdown("**NIFTY data connection** — use the Kite Connect Data Center above to authenticate and download NIFTY 50 spot candles, or upload a prepared CSV.")
 source=st.radio("Data source",["Use downloaded Kite candles","Upload Nifty spot CSV"],horizontal=True)
 data=None
 if source=="Use downloaded Kite candles":
@@ -1257,17 +1280,7 @@ if data is not None:
     try:
         preview=prepare_spot(data)
         preview=build_signals(preview, min_breakout_body=float(min_breakout_body), selected_setups=active_setups)
-        st.subheader("Market data chart — pre-backtest")
-        st.caption("Inspect the uploaded/downloaded 5-minute spot candles and previous-session body-based PDH/PDL before running a strategy.")
-        st.plotly_chart(
-            build_trade_chart(data, show_levels=True),
-            use_container_width=True,
-            key="nql_pre_backtest_chart",
-            config={"scrollZoom": True, "displaylogo": False,
-                    "displayModeBar": True,
-                    "modeBarButtonsToAdd": ["zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"],
-                    "modeBarButtonsToRemove": ["toImage"]},
-        )
+        # Pre-backtest chart intentionally removed: chart is shown after a completed backtest only.
         st.subheader("Automatic parameter research")
         st.caption("The optimizer searches breakout body, SL buffer, target R:R, gap threshold and reversal cutoff. It selects settings on training/validation data and reports the final untouched test period separately.")
         optimizer_min_trades=st.number_input("Minimum trades required per candidate", min_value=10, max_value=500, value=50, step=10, key="optimizer_min_trades")
@@ -1385,10 +1398,18 @@ if data is not None:
                     build_trade_chart(data, trades, show_levels=True),
                     use_container_width=True,
                     key="nql_trade_boxes_chart",
-                    config={"scrollZoom": True, "displaylogo": False,
-                            "displayModeBar": True,
-                            "modeBarButtonsToAdd": ["zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"],
-                            "modeBarButtonsToRemove": ["toImage"]},
+                    config={
+                        "scrollZoom": True,
+                        "doubleClick": "reset",
+                        "displaylogo": False,
+                        "displayModeBar": True,
+                        "responsive": True,
+                        "modeBarButtonsToAdd": [
+                            "pan2d", "zoom2d", "zoomIn2d", "zoomOut2d",
+                            "autoScale2d", "resetScale2d"
+                        ],
+                        "modeBarButtonsToRemove": ["toImage", "select2d", "lasso2d"],
+                    },
                 )
                 st.caption(f"Results retained for this dataset • Generated {saved_bt.get('created_at','')}")
                 cols=st.columns(4)

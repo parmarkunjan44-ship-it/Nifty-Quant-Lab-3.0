@@ -5,7 +5,7 @@ This release is a staged upgrade of the supplied v2.3 codebase. It retains the e
 ## v3.0 research workflow
 
 1. Connect Kite and download NIFTY 50 spot 5-minute candles, or upload a CSV.
-2. Inspect the pre-backtest candlestick chart and body-based previous-session PDH/PDL levels.
+2. Select the Kite-downloaded candles or upload a NIFTY spot CSV. The chart is intentionally hidden before the backtest.
 3. Choose combined setup testing or one individual entry setup.
 4. Run the backtest. The NIFTY backtest enforces **one trade per trading day**.
 5. Review R-multiple statistics, trade log, and the post-backtest chart.
@@ -22,7 +22,7 @@ Individual tests filter the signal engine to the selected setup. The current sig
 
 ## Chart behavior
 
-The Plotly candlestick chart uses the original spot OHLC data. Each backtested trade is drawn from its actual `entry_time` through `exit_time` using trade-log prices:
+The post-backtest Plotly candlestick chart uses the original spot OHLC data. It shows the latest candle OHLC in the chart corner and the hovered candle OHLC in its tooltip. It has no volume panel and no VWAP. Each backtested trade is drawn from its actual `entry_time` through `exit_time` using trade-log prices:
 
 - Red rectangle: entry-to-initial-stop risk zone.
 - Green rectangle: entry-to-target reward zone.
@@ -30,6 +30,8 @@ The Plotly candlestick chart uses the original spot OHLC data. Each backtested t
 - Red dotted line: stop.
 - Green dotted line: target.
 - Annotation: LONG/SHORT, trade number, and realized R multiple.
+- PDH/PDL: continuous solid session lines.
+- Chart navigation: scroll zoom, pan, zoom controls, reset, and independent right-side price and bottom time axes.
 
 The boxes use the initial stop and target recorded by the current fixed-SL/target engine. They do not yet replay trailing-stop levels on the main trade chart; trailing-stop analysis remains a separate comparison module.
 
