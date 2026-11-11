@@ -1,0 +1,11 @@
+Nifty Quant Lab v3.0 staged upgrade
+
+- Updated product identity and requirements to v3.0.
+- Added Plotly interactive NIFTY spot candlestick chart before backtesting.
+- Added body-based PDH/PDL level overlays.
+- Added individual entry-setup filtering for all ten directional PDHL setup labels.
+- Enforced exactly one NIFTY trade per day in run_backtest, irrespective of UI state.
+- Added post-backtest TradingView-style red risk and green reward boxes based on actual trade-log entry/exit timestamps and prices.
+- Added trade direction, trade number, and realized R annotations.
+- Preserved existing Kite, optimizer, BTC modules, Telegram/live-signal code and legacy options engine.
+- Updated README with methodology, R definition, deployment cautions and validation limitations.
