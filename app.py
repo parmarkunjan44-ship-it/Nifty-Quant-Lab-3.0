@@ -1,5 +1,6 @@
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import requests, hashlib, time, json, sqlite3, threading, traceback, os
@@ -199,54 +200,108 @@ SETUP_NAMES = [
 ]
 
 def build_trade_chart(data, trades=None, show_levels=True):
-    """Interactive OHLC chart with TradingView-style risk/reward boxes from actual trade records."""
-    x = prepare_spot(data)
-    fig = go.Figure(data=[go.Candlestick(
+    """TradingView-inspired NIFTY chart with OHLC candles, volume and trade risk/reward boxes."""
+    x = prepare_spot(data).copy()
+    x["datetime"] = pd.to_datetime(x["datetime"])
+
+    # Two synchronized panels: price above, volume below (when volume is available).
+    has_volume = "volume" in x.columns and pd.to_numeric(x["volume"], errors="coerce").notna().any()
+    if has_volume:
+        fig = make_subplots(
+            rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.025,
+            row_heights=[0.80, 0.20],
+        )
+    else:
+        fig = go.Figure()
+
+    candle = go.Candlestick(
         x=x["datetime"], open=x["open"], high=x["high"], low=x["low"], close=x["close"],
-        name="NIFTY spot", increasing_line_color="#16a34a", decreasing_line_color="#dc2626"
-    )])
+        name="NIFTY 50", increasing=dict(line=dict(color="#089981", width=1), fillcolor="#089981"),
+        decreasing=dict(line=dict(color="#F23645", width=1), fillcolor="#F23645"),
+        whiskerwidth=0.45,
+    )
+    if has_volume:
+        fig.add_trace(candle, row=1, col=1)
+        vol = pd.to_numeric(x["volume"], errors="coerce").fillna(0)
+        vol_colors = ["#089981" if c >= o else "#F23645" for o, c in zip(x["open"], x["close"])]
+        fig.add_trace(go.Bar(x=x["datetime"], y=vol, marker_color=vol_colors,
+                             name="Volume", opacity=0.65), row=2, col=1)
+    else:
+        fig.add_trace(candle)
+
     if show_levels:
         levels = build_signals(x)
-        for col, label, color in [("pdh", "PDH", "#d69e2e"), ("pdl", "PDL", "#64748b")]:
+        for col, label, color in [("pdh", "PDH", "#E5A000"), ("pdl", "PDL", "#8B9BB4")]:
             if col in levels and levels[col].notna().any():
-                # Previous-day level is piecewise constant; draw each session's level.
                 daily = levels.groupby("trade_date", sort=True).agg(
                     x0=("datetime", "min"), x1=("datetime", "max"), level=(col, "first")
                 ).dropna(subset=["level"])
                 for _, row in daily.iterrows():
                     fig.add_shape(type="line", x0=row.x0, x1=row.x1,
-                                  y0=row.level, y1=row.level, line=dict(color=color, width=1, dash="dot"),
-                                  opacity=0.35, layer="below")
+                                  y0=row.level, y1=row.level,
+                                  line=dict(color=color, width=1, dash="dot"), opacity=0.7,
+                                  layer="below", row=1 if has_volume else None, col=1 if has_volume else None)
+
     if trades is not None and not trades.empty:
         for n, tr in trades.reset_index(drop=True).iterrows():
-            entry_t = pd.to_datetime(tr["entry_time"]); exit_t = pd.to_datetime(tr["exit_time"])
+            entry_t = pd.to_datetime(tr["entry_time"])
+            exit_t = pd.to_datetime(tr["exit_time"])
             entry, stop, target = float(tr["entry"]), float(tr["stop"]), float(tr["target"])
             side = str(tr["direction"]).upper()
             x0, x1 = entry_t, max(exit_t, entry_t + pd.Timedelta(minutes=5))
             if side == "LONG":
                 loss_y0, loss_y1, profit_y0, profit_y1 = stop, entry, entry, target
-                color, label = "#16a34a", "LONG"
+                label = "LONG"
             else:
                 loss_y0, loss_y1, profit_y0, profit_y1 = entry, stop, target, entry
-                color, label = "#dc2626", "SHORT"
+                label = "SHORT"
+            shape_row = {"row": 1, "col": 1} if has_volume else {}
             fig.add_shape(type="rect", x0=x0, x1=x1, y0=loss_y0, y1=loss_y1,
-                          fillcolor="rgba(220,38,38,0.20)", line=dict(color="rgba(220,38,38,0.85)", width=1))
+                          fillcolor="rgba(242,54,69,0.20)",
+                          line=dict(color="rgba(242,54,69,0.85)", width=1), **shape_row)
             fig.add_shape(type="rect", x0=x0, x1=x1, y0=profit_y0, y1=profit_y1,
-                          fillcolor="rgba(22,163,74,0.20)", line=dict(color="rgba(22,163,74,0.85)", width=1))
-            for price, dash, col in [(entry,"solid","#2563eb"),(stop,"dot","#dc2626"),(target,"dot","#16a34a")]:
+                          fillcolor="rgba(8,153,129,0.20)",
+                          line=dict(color="rgba(8,153,129,0.85)", width=1), **shape_row)
+            for price, dash, color in [(entry, "solid", "#2962FF"),
+                                       (stop, "dot", "#F23645"),
+                                       (target, "dot", "#089981")]:
                 fig.add_shape(type="line", x0=x0, x1=x1, y0=price, y1=price,
-                              line=dict(color=col, width=1.2, dash=dash))
+                              line=dict(color=color, width=1.2, dash=dash), **shape_row)
             r_value = float(tr.get("R_multiple", 0.0))
-            fig.add_annotation(x=entry_t, y=entry, text=f"{label} #{n+1} | {r_value:+.2f}R",
-                               showarrow=True, arrowhead=2, ax=0, ay=-38 if side=="LONG" else 38,
-                               bgcolor="rgba(15,23,42,0.88)", font=dict(color="white", size=10))
-    fig.update_layout(height=680, xaxis_rangeslider_visible=True, hovermode="x unified",
-                      margin=dict(l=10,r=10,t=35,b=10), legend=dict(orientation="h"),
-                      yaxis_title="NIFTY spot price", xaxis_title="Candle time",
-                      template="plotly_white")
+            fig.add_annotation(x=entry_t, y=entry,
+                               text=f"{label} #{n+1} | {r_value:+.2f}R",
+                               showarrow=True, arrowhead=2, ax=0,
+                               ay=-38 if side == "LONG" else 38,
+                               bgcolor="rgba(30,34,45,0.92)",
+                               bordercolor="#434651", font=dict(color="#D1D4DC", size=10),
+                               **shape_row)
+
+    axis_style = dict(showgrid=True, gridcolor="#1F2430", zeroline=False,
+                      showline=True, linecolor="#363C4E", tickfont=dict(color="#B2B5BE"),
+                      showspikes=True, spikemode="across", spikesnap="cursor",
+                      spikethickness=1, spikecolor="#758696")
+    fig.update_layout(
+        height=820 if has_volume else 760,
+        template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
+        font=dict(color="#D1D4DC", size=11),
+        margin=dict(l=12, r=68, t=42, b=22),
+        hovermode="x unified", dragmode="pan",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", y=1.02, x=0),
+        hoverlabel=dict(bgcolor="#1E222D", font_color="#FFFFFF"),
+    )
+    fig.update_xaxes(**axis_style, rangeslider_visible=False,
+                     rangebreaks=[dict(bounds=["sat", "mon"]),
+                                   dict(bounds=[15.5, 9.25], pattern="hour")])
+    fig.update_yaxes(**axis_style, side="right", title_text="NIFTY 50", row=1 if has_volume else None,
+                     col=1 if has_volume else None)
+    if has_volume:
+        fig.update_yaxes(title_text="Volume", side="right", showgrid=False, row=2, col=1)
+        fig.update_xaxes(title_text="", row=1, col=1)
+        fig.update_xaxes(title_text="India market time", row=2, col=1)
+    else:
+        fig.update_xaxes(title_text="India market time")
     return fig
-
-
 def trailing_stop_analysis(data, trades, atr_mult=2.0, swing_lookback=3):
     """Replay the same PDHL entries with alternative exits; no entry rules are changed.
     Trailing levels are updated after each candle and become active on the next candle.
