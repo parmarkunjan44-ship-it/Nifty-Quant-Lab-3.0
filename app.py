@@ -1,5 +1,4 @@
 import streamlit as st
-import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import requests, hashlib, time, json, sqlite3, threading, traceback, os
@@ -8,10 +7,87 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Nifty Quant Lab v3.0", page_icon="📈", layout="wide")
-st.title("📈 Nifty Quant Lab — v3.0 Research Workbench")
-st.caption("Spot-signal PDHL research • Setup-isolated testing • R-multiple analytics • TradingView-style trade boxes • BTC research modules retained")
+st.title("📈 Nifty Quant Lab v3.0")
+st.caption("Unified NIFTY 50 + BTC research workspace | Existing Kite and Telegram live-alert features retained")
+st.caption("Nifty PDHL research + BTC EMA/Stoch RSI research • Independent markets and statistics")
 KITE_API_ROOT = "https://api.kite.trade"
 KITE_LOGIN_ROOT = "https://kite.zerodha.com/connect/login"
+
+
+
+def render_tradingview_chart(candles, trades=None, chart_key="nifty_chart", max_candles=2500):
+    """TradingView-inspired interactive OHLC chart; source OHLC/timestamps are never altered."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    d = candles.copy()
+    d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
+    d = d.dropna(subset=["datetime", "open", "high", "low", "close"]).sort_values("datetime")
+    if len(d) > max_candles:
+        st.info(f"Chart preview is limited to the latest {max_candles:,} candles for browser performance. Backtest still uses the full dataset.")
+        d = d.tail(max_candles).copy()
+    # Price-only chart: volume bars are intentionally omitted.
+    rows = 1
+    fig = make_subplots(rows=1, cols=1, shared_xaxes=True, vertical_spacing=0.025,
+                        specs=[[{"secondary_y": False}]])
+    up = "#26a69a"; down = "#ef5350"
+    fig.add_trace(go.Candlestick(x=d.datetime, open=d.open, high=d.high, low=d.low, close=d.close,
+        name="NIFTY 50", increasing_line_color=up, increasing_fillcolor=up,
+        decreasing_line_color=down, decreasing_fillcolor=down, whiskerwidth=0.55), row=1, col=1)
+    # Previous-day body levels from the signal engine, when available.
+    for col, label, color in [("pdh", "PDH", "#f0b90b"), ("pdl", "PDL", "#42a5f5")]:
+        if col in d.columns and d[col].notna().any():
+            level = float(d[col].dropna().iloc[-1])
+            fig.add_hline(y=level, line_dash="solid", line_width=1, line_color=color,
+                          annotation_text=f"{label} {level:.2f}", annotation_position="right", row=1, col=1)
+    # TradingView-position-tool style boxes from the actual backtest trade records.
+    if trades is not None and len(trades):
+        t = pd.DataFrame(trades).copy()
+        t["entry_time"] = pd.to_datetime(t["entry_time"], errors="coerce")
+        t["exit_time"] = pd.to_datetime(t["exit_time"], errors="coerce")
+        visible_start, visible_end = d.datetime.min(), d.datetime.max()
+        t = t[(t.entry_time >= visible_start) & (t.entry_time <= visible_end)]
+        for n, tr in t.reset_index(drop=True).iterrows():
+            if pd.isna(tr.entry_time) or pd.isna(tr.exit_time):
+                continue
+            long_trade = str(tr.get("direction", "LONG")).upper() == "LONG"
+            entry, stop, target = float(tr.entry), float(tr.stop), float(tr.target)
+            x0, x1 = tr.entry_time, tr.exit_time
+            # Profit zone and risk zone use the same green/red convention as TradingView.
+            profit_low, profit_high = (entry, target) if long_trade else (target, entry)
+            risk_low, risk_high = (stop, entry) if long_trade else (entry, stop)
+            fig.add_shape(type="rect", x0=x0, x1=x1, y0=profit_low, y1=profit_high,
+                fillcolor="rgba(38,166,154,0.18)", line=dict(color="rgba(38,166,154,0.75)", width=1), row=1, col=1)
+            fig.add_shape(type="rect", x0=x0, x1=x1, y0=risk_low, y1=risk_high,
+                fillcolor="rgba(239,83,80,0.18)", line=dict(color="rgba(239,83,80,0.75)", width=1), row=1, col=1)
+            fig.add_shape(type="line", x0=x0, x1=x1, y0=entry, y1=entry,
+                line=dict(color="#e5e7eb", width=1.2, dash="dot"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=[x1], y=[float(tr.exit)], mode="markers+text",
+                marker=dict(size=7, color=up if float(tr.get("R_multiple", 0)) >= 0 else down),
+                text=[f"T{n+1} {float(tr.get('R_multiple', 0)):+.2f}R"], textposition="top center",
+                name=f"Trade {n+1}", showlegend=False,
+                hovertemplate=(f"Trade {n+1}<br>{tr.get('setup','')}<br>{tr.get('direction','')}<br>"
+                               f"Entry: {entry:.2f}<br>SL: {stop:.2f}<br>Target: {target:.2f}<br>"
+                               f"Exit: {float(tr.exit):.2f}<br>Result: {float(tr.get('R_multiple',0)):+.2f}R<extra></extra>")), row=1, col=1)
+    fig.update_layout(template="plotly_dark", height=680, autosize=True,
+        margin=dict(l=12, r=72, t=38, b=18), paper_bgcolor="#131722", plot_bgcolor="#131722",
+        font=dict(family="Arial, sans-serif", size=11, color="#d1d4dc"),
+        xaxis_rangeslider_visible=False, hovermode="x unified",
+        legend=dict(orientation="h", y=1.02, x=0),
+        dragmode="pan", uirevision=chart_key)
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(42,46,57,0.8)",
+        rangeslider_visible=False, showspikes=True, spikemode="across", spikesnap="cursor",
+        spikecolor="#787b86", spikethickness=1,
+        rangebreaks=[dict(bounds=[15.5, 9.25], pattern="hour"), dict(bounds=[6, 0], pattern="day of week")])
+    fig.update_yaxes(side="right", showgrid=True, gridcolor="rgba(42,46,57,0.8)",
+        zeroline=False, fixedrange=False, row=1, col=1)
+    fig.update_xaxes(title_text="Time (IST)", row=rows, col=1)
+    st.plotly_chart(fig, use_container_width=True, config={
+        "responsive": True, "scrollZoom": True, "displaylogo": False,
+        "modeBarButtonsToAdd": ["drawline", "drawrect", "eraseshape"],
+        "toImageButtonOptions": {"format": "png", "filename": "nifty_tradingview_style_chart", "scale": 2}
+    }, key=chart_key)
+
 
 def compound_capital_path(trades, initial_capital, risk_pct):
     """Apply each trade R to a fixed percentage of current equity, chronologically."""
@@ -56,285 +132,227 @@ def candle_parts(r):
     lower=min(float(r.open),float(r.close))-float(r.low)
     return body,max(0.0,upper),max(0.0,lower)
 
-def build_signals(df, gap_threshold=50.0, cutoff="11:00", min_breakout_body=50.0, progress_callback=None, selected_setups=None):
-    """Build PDHL signals using previous-session candle BODY levels."""
-    x=prepare_spot(df)
-    # Body high/low, not wick high/low, define previous-day PDH/PDL.
+def _entry_wick_pass(row, side):
+    """Directional wick filter used on every setup's entry candle."""
+    body, upper, lower = candle_parts(row)
+    return upper <= body if side == "LONG" else lower <= body
+
+
+def build_signals(df, gap_threshold=50.0, cutoff="11:00", min_breakout_body=50.0, progress_callback=None):
+    """Build one earliest valid PDHL signal per session using confirmed rules.
+
+    Signal candle is the candle that satisfies the setup. Execution is on the
+    next 5-minute candle open in run_backtest. PDH/PDL use prior-session bodies.
+    """
+    x = prepare_spot(df)
     x["body_high"] = x[["open", "close"]].max(axis=1)
     x["body_low"] = x[["open", "close"]].min(axis=1)
-    daily=x.groupby("trade_date").agg(
-        pdh=("body_high", "max"), pdl=("body_low", "min")
-    )
-    dates=list(daily.index); prev={}
-    for j in range(1,len(dates)):
-        d=dates[j]; prev[d]=(float(daily.iloc[j-1].pdh),float(daily.iloc[j-1].pdl))
-    x["pdh"]=x.trade_date.map(lambda d: prev.get(d,(np.nan,np.nan))[0])
-    x["pdl"]=x.trade_date.map(lambda d: prev.get(d,(np.nan,np.nan))[1])
-    x["signal"]=""; x["setup"]=""; x["signal_reason"]=""; x["gap_points"]=np.nan
-    x["opening_body_high"]=np.nan; x["opening_body_low"]=np.nan
-    grouped_sessions=list(x.groupby("trade_date").groups.items())
-    total_sessions=max(1,len(grouped_sessions))
-    for session_no, (d, idx) in enumerate(grouped_sessions, start=1):
-        if progress_callback and (session_no == 1 or session_no % 25 == 0 or session_no == total_sessions):
-            progress_callback(0.05 + 0.20 * session_no / total_sessions, f"Building PDH/PDL signals: session {session_no:,} of {total_sessions:,}")
-        ids=list(idx); first_i=ids[0]
-        if pd.isna(x.at[first_i,"pdh"]): continue
-        first=x.loc[first_i]
-        pdh=float(first.pdh); pdl=float(first.pdl); today_open=float(first.open)
-        # An open inside the prior-day range is NOT a no-trade day.
-        # Wait for a qualifying PDH breakout or PDL breakdown.
-        if pdl <= today_open <= pdh:
-            gap_points=0.0
-            gap_mode="inside_range"
-        elif today_open > pdh:
-            gap_points=today_open-pdh
-            gap_mode="gap_up" if gap_points>gap_threshold else "small_gap"
+    daily = x.groupby("trade_date").agg(pdh=("body_high", "max"), pdl=("body_low", "min"))
+    dates = list(daily.index)
+    prev = {dates[j]: (float(daily.iloc[j-1].pdh), float(daily.iloc[j-1].pdl)) for j in range(1, len(dates))}
+    x["pdh"] = x.trade_date.map(lambda d: prev.get(d, (np.nan, np.nan))[0])
+    x["pdl"] = x.trade_date.map(lambda d: prev.get(d, (np.nan, np.nan))[1])
+    for col, default in [("signal", ""), ("setup", ""), ("signal_reason", ""), ("signal_candle_time", ""), ("entry_candle_time", ""), ("sl_reference", "")]:
+        x[col] = default
+    x["gap_points"] = np.nan
+    x["opening_body_high"] = np.nan
+    x["opening_body_low"] = np.nan
+    sessions = list(x.groupby("trade_date").groups.items())
+    total = max(1, len(sessions))
+    for session_no, (day, idx) in enumerate(sessions, 1):
+        if progress_callback and (session_no == 1 or session_no % 25 == 0 or session_no == total):
+            progress_callback(0.05 + 0.20 * session_no / total, f"Building PDH/PDL signals: session {session_no:,} of {total:,}")
+        ids = list(idx)
+        if not ids or pd.isna(x.at[ids[0], "pdh"]):
+            continue
+        first_i = ids[0]
+        first = x.loc[first_i]
+        pdh, pdl = float(first.pdh), float(first.pdl)
+        opening_body_high = max(float(first.open), float(first.close))
+        opening_body_low = min(float(first.open), float(first.close))
+        # Gap is measured from the opening candle BODY edge to PDH/PDL.
+        if opening_body_low > pdh:
+            gap_points = opening_body_low - pdh
+            gap_mode = "gap_up" if gap_points >= float(gap_threshold) else "small_gap"
+        elif opening_body_high < pdl:
+            gap_points = pdl - opening_body_high
+            gap_mode = "gap_down" if gap_points >= float(gap_threshold) else "small_gap"
         else:
-            gap_points=pdl-today_open
-            gap_mode="gap_down" if gap_points>gap_threshold else "small_gap"
-        # Gap reversal reference is the FIRST 5-minute candle body only.
-        opening_body_high=max(float(first.open),float(first.close))
-        opening_body_low=min(float(first.open),float(first.close))
-        x.loc[ids,"gap_points"]=gap_points
-        x.loc[ids,"opening_body_high"]=opening_body_high
-        x.loc[ids,"opening_body_low"]=opening_body_low
-        for pos,i in enumerate(ids):
-            r=x.loc[i]; tm=r.datetime.strftime("%H:%M")
-            prevrow=x.loc[ids[pos-1]] if pos>0 else None
-            body,up,lo=candle_parts(r)
-            side=setup=reason=""
-            # Standard breakout and trap setups apply only on small outside gaps.
-            if gap_mode in ("small_gap", "inside_range"):
-                # Inside-range sessions wait for a genuine PDH/PDL close breakout.
-                if r.close>r.pdh and r.close>r.open and body>=min_breakout_body and up<=body:
-                    side,setup,reason="LONG","PDH momentum",f"Bullish body >={min_breakout_body:g}; close above body-based PDH; upper wick <= body"
-                elif r.close<r.pdl and r.close<r.open and body>=min_breakout_body and lo<=body:
-                    side,setup,reason="SHORT","PDL momentum",f"Bearish body >={min_breakout_body:g}; close below body-based PDL; lower wick <= body"
-                if not side and prevrow is not None:
-                    if prevrow.close>r.pdh and r.close>r.pdh and r.close>r.open and body>=min_breakout_body and up<=body:
-                        side,setup,reason="LONG","PDH two-close","Two closes above PDH; second candle upper wick <= body"
-                    elif prevrow.close<r.pdl and r.close<r.pdl and r.close<r.open and body>=min_breakout_body and lo<=body:
-                        side,setup,reason="SHORT","PDL two-close","Two closes below PDL; second candle lower wick <= body"
-                if not side and prevrow is not None:
-                    if prevrow.close>r.pdh and r.close<r.pdh and r.close>r.pdl:
-                        side,setup,reason="SHORT","PDH trap","Break above PDH then next candle closes back inside body-based range"
-                    elif prevrow.close<r.pdl and r.close>r.pdl and r.close<r.pdh:
-                        side,setup,reason="LONG","PDL trap","Break below PDL then next candle closes back inside body-based range"
-                if not side and prevrow is not None:
-                    if prevrow.close>r.pdh and r.low<=r.pdh and r.close>r.pdh:
-                        side,setup,reason="LONG","Small-gap PDH support","Retest touched body-based PDH and closed above"
-                    elif prevrow.close<r.pdl and r.high>=r.pdl and r.close<r.pdl:
-                        side,setup,reason="SHORT","Small-gap PDL resistance","Retest touched body-based PDL and closed below"
-            # Large-gap reversal: break of first 5m candle BODY level after it closes.
-            if not side and pos>0 and tm<cutoff:
-                if gap_mode=="gap_up" and r.low<opening_body_low and prevrow.close>=opening_body_low:
-                    side,setup,reason="SHORT","Gap-up reversal","Open above body-based PDH by >50; broke first 5m candle body low before 11:00"
-                elif gap_mode=="gap_down" and r.high>opening_body_high and prevrow.close<=opening_body_high:
-                    side,setup,reason="LONG","Gap-down reversal","Open below body-based PDL by >50; broke first 5m candle body high before 11:00"
-            # Setup isolation: discard non-selected classifications and continue scanning later candles.
-            if side and selected_setups is not None and setup not in selected_setups:
-                side = setup = reason = ""
-            if side:
-                x.at[i,"signal"]=side; x.at[i,"setup"]=setup; x.at[i,"signal_reason"]=reason
+            gap_points = 0.0
+            gap_mode = "inside_range"
+        x.loc[ids, "gap_points"] = gap_points
+        x.loc[ids, "opening_body_high"] = opening_body_high
+        x.loc[ids, "opening_body_low"] = opening_body_low
+
+        # Only the first close outside the range is tested for momentum.
+        first_break_pos = None
+        first_break_side = None
+        for pos, i in enumerate(ids):
+            r = x.loc[i]
+            if r.close > pdh:
+                first_break_pos, first_break_side = pos, "LONG"
                 break
+            if r.close < pdl:
+                first_break_pos, first_break_side = pos, "SHORT"
+                break
+
+        selected = None
+        # Large-gap reversal: later candle CLOSE, not wick, crosses opening body edge.
+        if gap_mode in ("gap_up", "gap_down"):
+            for pos in range(1, len(ids)):
+                i = ids[pos]
+                r = x.loc[i]
+                tm = r.datetime.strftime("%H:%M")
+                if tm >= cutoff:
+                    break
+                if gap_mode == "gap_up" and float(r.close) < opening_body_low and _entry_wick_pass(r, "SHORT"):
+                    selected = (i, "SHORT", "Gap-up reversal", "Close below first 5-minute candle body low; directional wick filter passed", "signal")
+                    break
+                if gap_mode == "gap_down" and float(r.close) > opening_body_high and _entry_wick_pass(r, "LONG"):
+                    selected = (i, "LONG", "Gap-down reversal", "Close above first 5-minute candle body high; directional wick filter passed", "signal")
+                    break
+        else:
+            # First breakout candle momentum, otherwise only the immediately next
+            # candle can confirm the second consecutive close.
+            if first_break_pos is not None:
+                i = ids[first_break_pos]
+                r = x.loc[i]
+                body, upper, lower = candle_parts(r)
+                side = first_break_side
+                momentum = (body >= float(min_breakout_body) and _entry_wick_pass(r, side)
+                            and ((side == "LONG" and r.close > r.open) or (side == "SHORT" and r.close < r.open)))
+                if momentum:
+                    selected = (i, side, "PDH momentum" if side == "LONG" else "PDL momentum",
+                                "First breakout candle qualifies as momentum and passes wick filter", "signal")
+                else:
+                    next_pos = first_break_pos + 1
+                    if next_pos < len(ids):
+                        j = ids[next_pos]
+                        confirm = x.loc[j]
+                        confirms = (confirm.close > pdh if side == "LONG" else confirm.close < pdl)
+                        if confirms and _entry_wick_pass(confirm, side):
+                            selected = (j, side, "PDH two-close" if side == "LONG" else "PDL two-close",
+                                        "First breakout close followed by second consecutive close; entry candle passes wick filter", "entry")
+
+            # Traps are allowed only when breakout entry has NOT activated.
+            # PDH trap: previous close > PDH, current close < PDH.
+            # PDL trap: previous close < PDL, current close > PDL.
+            if selected is None:
+                for pos in range(1, len(ids)):
+                    i, pi = ids[pos], ids[pos-1]
+                    r, pr = x.loc[i], x.loc[pi]
+                    if pr.close > pdh and r.close < pdh and _entry_wick_pass(r, "SHORT"):
+                        selected = (i, "SHORT", "PDH trap", "Previous candle closed above PDH; current candle closed below PDH; PDH breakout entry not activated", "signal")
+                        break
+                    if pr.close < pdl and r.close > pdl and _entry_wick_pass(r, "LONG"):
+                        selected = (i, "LONG", "PDL trap", "Previous candle closed below PDL; current candle closed above PDL; PDL breakdown entry not activated", "signal")
+                        break
+
+            # Small-gap / inside-range retests: touch and close back beyond level.
+            if selected is None:
+                for pos in range(1, len(ids)):
+                    i, pi = ids[pos], ids[pos-1]
+                    r, pr = x.loc[i], x.loc[pi]
+                    if pr.close > pdh and r.low <= pdh and r.close > pdh and _entry_wick_pass(r, "LONG"):
+                        selected = (i, "LONG", "Small-gap PDH support", "Retest touched PDH and closed above; wick filter passed", "signal")
+                        break
+                    if pr.close < pdl and r.high >= pdl and r.close < pdl and _entry_wick_pass(r, "SHORT"):
+                        selected = (i, "SHORT", "Small-gap PDL resistance", "Retest touched PDL and closed below; wick filter passed", "signal")
+                        break
+        if selected:
+            i, side, setup, reason, sl_ref = selected
+            x.at[i, "signal"] = side
+            x.at[i, "setup"] = setup
+            x.at[i, "signal_reason"] = reason
+            x.at[i, "signal_candle_time"] = str(x.at[i, "datetime"])
+            x.at[i, "entry_candle_time"] = str(x.at[i, "datetime"])
+            x.at[i, "sl_reference"] = sl_ref
     return x
 
-def run_backtest(df, max_trades_day=1, entry_mode="Next candle open", sl_buffer=10.0, rr=2.0, min_breakout_body=50.0, gap_threshold=50.0, cutoff="11:00", progress_callback=None, selected_setups=None):
-    # v3.0 research policy: one trade per day, regardless of UI state.
-    max_trades_day = 1
-    sig=build_signals(df, min_breakout_body=min_breakout_body, gap_threshold=gap_threshold, cutoff=cutoff, progress_callback=progress_callback, selected_setups=selected_setups)
-    out=[]; counts={}
-    total_rows=max(1,len(sig))
-    for row_no,(i,r) in enumerate(sig.iterrows(), start=1):
+
+def run_backtest(df, max_trades_day=1, entry_mode="Next candle open", sl_buffer=10.0, rr=2.0, min_breakout_body=50.0, gap_threshold=50.0, cutoff="11:00", progress_callback=None):
+    """Execute confirmed signals at the next 5-minute candle open; one/day default."""
+    sig = build_signals(df, min_breakout_body=min_breakout_body, gap_threshold=gap_threshold, cutoff=cutoff, progress_callback=progress_callback)
+    out, counts = [], {}
+    total_rows = max(1, len(sig))
+    for row_no, (i, r) in enumerate(sig.iterrows(), 1):
         if progress_callback and (row_no == 1 or row_no % 3000 == 0 or row_no == total_rows):
             progress_callback(0.25 + 0.74 * row_no / total_rows, f"Simulating trades: candle {row_no:,} of {total_rows:,}")
-        day=r.trade_date; side=r.signal
-        if not side or counts.get(day,0)>=max_trades_day: continue
-        nxt=i+1
-        if nxt>=len(sig) or sig.iloc[nxt].trade_date!=day: continue
-        # Large-gap reversal fills at the first 5-minute candle BODY boundary,
-        # as specified; other setups use the next candle open.
-        is_gap_reversal = str(r.setup) in ("Gap-up reversal", "Gap-down reversal")
-        if is_gap_reversal:
-            entrybar = r
-            entry = float(r.opening_body_low if side == "SHORT" else r.opening_body_high)
+        day, side = r.trade_date, r.signal
+        if not side or counts.get(day, 0) >= min(1, int(max_trades_day)):
+            continue
+        # Entry always occurs at the following 5-minute candle OPEN.
+        nxt = sig.index.get_loc(i) + 1
+        if nxt >= len(sig):
+            continue
+        entrybar = sig.iloc[nxt]
+        if entrybar.trade_date != day:
+            continue
+        entry = float(entrybar.open)
+        setup = str(r.setup)
+        # For a two-close breakout, the second confirmation candle is the
+        # entry candle (per the strategy terminology) and supplies the SL.
+        # Actual execution still occurs at the following candle OPEN.
+        sl_row = r
+        if side == "LONG":
+            stop = float(sl_row.low) - float(sl_buffer)
+            risk = entry - stop
+            target = entry + float(rr) * risk
         else:
-            entrybar=sig.iloc[nxt] if entry_mode=="Next candle open" else r
-            entry=float(entrybar.open if entry_mode=="Next candle open" else r.close)
-        if side=="LONG": stop=float(r.low)-sl_buffer; risk=entry-stop; target=entry+rr*risk
-        else: stop=float(r.high)+sl_buffer; risk=stop-entry; target=entry-rr*risk
-        if risk<=0: continue
-        path_start = i if is_gap_reversal else (nxt if entry_mode=="Next candle open" else i)
-        path=sig.iloc[path_start:]
-        path=path[path.trade_date==day]
-        exit_price=exit_time=exit_reason=None
-        for _,b in path.iterrows():
-            if side=="LONG": hit_sl=b.low<=stop; hit_tp=b.high>=target
-            else: hit_sl=b.high>=stop; hit_tp=b.low<=target
-            if hit_sl: exit_price=stop; exit_time=b.datetime; exit_reason="SL"; break
-            if hit_tp: exit_price=target; exit_time=b.datetime; exit_reason="Target"; break
+            stop = float(sl_row.high) + float(sl_buffer)
+            risk = stop - entry
+            target = entry - float(rr) * risk
+        if risk <= 0:
+            continue
+        # Begin simulation at the entry candle; never inspect pre-entry movement.
+        path = sig.iloc[nxt:]
+        path = path[path.trade_date == day]
+        if path.empty:
+            continue
+        exit_price = exit_time = exit_reason = None
+        for _, b in path.iterrows():
+            # If market gaps through SL at candle open, use the worse opening fill.
+            if side == "LONG":
+                hit_sl = b.low <= stop
+                hit_tp = b.high >= target
+                if float(b.open) <= stop:
+                    exit_price, exit_time, exit_reason = float(b.open), b.datetime, "SL gap"
+                    break
+            else:
+                hit_sl = b.high >= stop
+                hit_tp = b.low <= target
+                if float(b.open) >= stop:
+                    exit_price, exit_time, exit_reason = float(b.open), b.datetime, "SL gap"
+                    break
+            if hit_sl:
+                exit_price, exit_time, exit_reason = stop, b.datetime, "SL"
+                break
+            if hit_tp:
+                exit_price, exit_time, exit_reason = target, b.datetime, "Target"
+                break
         if exit_price is None:
-            last=path.iloc[-1]; exit_price=float(last.close); exit_time=last.datetime; exit_reason="EOD"
-        pnl=(exit_price-entry) if side=="LONG" else (entry-exit_price)
-        out.append({"trade_date":str(day),"setup":r.setup,"direction":side,"signal_time":r.datetime,"entry_time":entrybar.datetime,"entry":entry,"stop":stop,"target":target,"exit_time":exit_time,"exit":exit_price,"exit_reason":exit_reason,"risk_points":risk,"pnl_points":pnl,"R_multiple":pnl/risk,"signal_reason":r.signal_reason,"PDH":r.pdh,"PDL":r.pdl})
-        counts[day]=counts.get(day,0)+1
-    trades=pd.DataFrame(out)
+            last = path.iloc[-1]
+            exit_price, exit_time, exit_reason = float(last.close), last.datetime, "EOD"
+        pnl = (exit_price - entry) if side == "LONG" else (entry - exit_price)
+        out.append({"trade_date": str(day), "setup": setup, "direction": side,
+                    "signal_time": r.datetime, "entry_time": entrybar.datetime,
+                    "entry": entry, "stop": stop, "target": target,
+                    "exit_time": exit_time, "exit": exit_price, "exit_reason": exit_reason,
+                    "risk_points": risk, "pnl_points": pnl, "R_multiple": pnl/risk,
+                    "signal_reason": r.signal_reason, "PDH": r.pdh, "PDL": r.pdl,
+                    "signal_candle_time": r.datetime, "entry_candle_time": entrybar.datetime,
+                    "sl_reference_candle_time": sl_row.datetime})
+        counts[day] = counts.get(day, 0) + 1
+    trades = pd.DataFrame(out)
     if trades.empty:
         if progress_callback: progress_callback(1.0, "Backtest complete — no qualifying trades")
         return trades, pd.DataFrame(), sig
-    trades=trades.sort_values("exit_time").reset_index(drop=True)
-    # R is normalized by each trade's initial stop distance, so trades with
-    # different stop sizes can be compared on the same risk scale.
-    trades["R_multiple"] = trades["pnl_points"] / trades["risk_points"]
-    trades["cumulative_R"] = trades["R_multiple"].cumsum()
-    trades["cumulative_points"]=trades.pnl_points.cumsum()
+    trades = trades.sort_values("exit_time").reset_index(drop=True)
+    trades["R_multiple"] = trades.pnl_points / trades.risk_points
+    trades["cumulative_R"] = trades.R_multiple.cumsum()
+    trades["cumulative_points"] = trades.pnl_points.cumsum()
     if progress_callback: progress_callback(1.0, "Backtest complete")
-    return trades,trades[["trade_date","pnl_points","cumulative_points","R_multiple","cumulative_R"]],sig
-
-
-SETUP_NAMES = [
-    "PDH momentum", "PDL momentum", "PDH two-close", "PDL two-close",
-    "PDH trap", "PDL trap", "Small-gap PDH support",
-    "Small-gap PDL resistance", "Gap-up reversal", "Gap-down reversal"
-]
-
-def build_trade_chart(data, trades=None, show_levels=True):
-    """TradingView-inspired NIFTY OHLC chart; no volume panel or indicators."""
-    x = prepare_spot(data)
-    fig = go.Figure(data=[go.Candlestick(
-        x=x["datetime"], open=x["open"], high=x["high"], low=x["low"], close=x["close"],
-        name="NIFTY 50", increasing_line_color="#089981",
-        increasing_fillcolor="#089981", decreasing_line_color="#F23645",
-        decreasing_fillcolor="#F23645", whiskerwidth=0.85,
-        hovertemplate=(
-            "<b>%{x|%d %b %Y %H:%M}</b><br>"
-            "O: %{open:.2f}<br>H: %{high:.2f}<br>"
-            "L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"
-        )
-    )])
-    # Fixed corner readout shows the most recent candle; hover reveals OHLC
-    # for the candle under the cursor in the chart tooltip.
-    last = x.iloc[-1]
-    last_color = "#089981" if float(last.close) >= float(last.open) else "#F23645"
-    fig.add_annotation(
-        x=0.012, y=0.985, xref="paper", yref="paper",
-        xanchor="left", yanchor="top", showarrow=False,
-        text=(f"O {last.open:,.2f}   H {last.high:,.2f}   "
-              f"L {last.low:,.2f}   C {last.close:,.2f}"),
-        font=dict(color=last_color, size=11, family="Arial"),
-        bgcolor="rgba(255,255,255,0.88)", bordercolor="#E0E3EB",
-        borderwidth=1, borderpad=5
-    )
-
-    if show_levels:
-        levels = build_signals(x)
-        # Draw continuous solid PDH/PDL segments for each trading session.
-        for col, label, color in [
-            ("pdh", "PDH", "#E0A526"),
-            ("pdl", "PDL", "#64748B"),
-        ]:
-            if col in levels and levels[col].notna().any():
-                daily = levels.groupby("trade_date", sort=True).agg(
-                    x0=("datetime", "min"), x1=("datetime", "max"),
-                    level=(col, "first")
-                ).dropna(subset=["level"])
-                for _, row in daily.iterrows():
-                    fig.add_shape(
-                        type="line", x0=row.x0, x1=row.x1,
-                        y0=float(row.level), y1=float(row.level),
-                        line=dict(color=color, width=1.6, dash="solid"),
-                        opacity=0.9, layer="above"
-                    )
-
-    # Preserve actual trade-record drawings and their entry/SL/target prices.
-    if trades is not None and not trades.empty:
-        for n, tr in trades.reset_index(drop=True).iterrows():
-            entry_t = pd.to_datetime(tr["entry_time"])
-            exit_t = pd.to_datetime(tr["exit_time"])
-            entry = float(tr["entry"])
-            stop = float(tr["stop"])
-            target = float(tr["target"])
-            side = str(tr["direction"]).upper()
-            x0, x1 = entry_t, max(exit_t, entry_t + pd.Timedelta(minutes=5))
-            if side == "LONG":
-                loss_y0, loss_y1, profit_y0, profit_y1 = stop, entry, entry, target
-                label = "LONG"
-            else:
-                loss_y0, loss_y1, profit_y0, profit_y1 = entry, stop, target, entry
-                label = "SHORT"
-            fig.add_shape(
-                type="rect", x0=x0, x1=x1, y0=loss_y0, y1=loss_y1,
-                fillcolor="rgba(242,54,69,0.18)",
-                line=dict(color="rgba(242,54,69,0.8)", width=1)
-            )
-            fig.add_shape(
-                type="rect", x0=x0, x1=x1, y0=profit_y0, y1=profit_y1,
-                fillcolor="rgba(8,153,129,0.18)",
-                line=dict(color="rgba(8,153,129,0.8)", width=1)
-            )
-            for price, dash, color in [
-                (entry, "solid", "#2962FF"),
-                (stop, "solid", "#F23645"),
-                (target, "solid", "#089981"),
-            ]:
-                fig.add_shape(
-                    type="line", x0=x0, x1=x1, y0=price, y1=price,
-                    line=dict(color=color, width=1.2, dash=dash)
-                )
-            r_value = float(tr.get("R_multiple", 0.0))
-            fig.add_annotation(
-                x=entry_t, y=entry,
-                text=f"{label} #{n+1} | {r_value:+.2f}R",
-                showarrow=True, arrowhead=2, ax=0,
-                ay=-38 if side == "LONG" else 38,
-                bgcolor="rgba(30,34,45,0.92)",
-                bordercolor="#434651", borderwidth=1,
-                font=dict(color="#FFFFFF", size=10)
-            )
-
-    fig.update_layout(
-        height=760,
-        template="plotly_white",
-        paper_bgcolor="#FFFFFF",
-        plot_bgcolor="#FFFFFF",
-        font=dict(color="#131722", size=11),
-        margin=dict(l=12, r=70, t=35, b=35),
-        hovermode="x unified",
-        dragmode="pan",
-        hoverdistance=35,
-        spikedistance=-1,
-        showlegend=False,
-        uirevision="nql_tradingview_chart",
-        xaxis=dict(
-            title="", type="date", side="bottom",
-            rangeslider=dict(visible=False), fixedrange=False,
-            autorange=True, constrain="domain",
-            showgrid=True, gridcolor="#E6E8EB", zeroline=False,
-            showline=True, linecolor="#D1D4DC",
-            tickfont=dict(color="#434651"),
-            showspikes=True, spikemode="across", spikesnap="cursor",
-            spikethickness=1, spikecolor="#787B86",
-            rangebreaks=[
-                dict(bounds=["sat", "mon"]),
-                dict(bounds=[15.5, 9.25], pattern="hour"),
-            ],
-        ),
-        yaxis=dict(
-            title="", side="right", fixedrange=False,
-            autorange=True,
-            showgrid=True, gridcolor="#E6E8EB", zeroline=False,
-            showline=True, linecolor="#D1D4DC",
-            tickfont=dict(color="#434651"),
-            showspikes=True, spikemode="across", spikesnap="cursor",
-            spikethickness=1, spikecolor="#787B86",
-            automargin=True,
-        ),
-        hoverlabel=dict(bgcolor="#FFFFFF", bordercolor="#D1D4DC",
-                        font=dict(color="#131722")),
-        modebar=dict(orientation="v", bgcolor="rgba(255,255,255,0.85)",
-                     color="#434651", activecolor="#2962FF"),
-    )
-    return fig
+    return trades, trades[["trade_date", "pnl_points", "cumulative_points", "R_multiple", "cumulative_R"]], sig
 
 
 def trailing_stop_analysis(data, trades, atr_mult=2.0, swing_lookback=3):
@@ -898,7 +916,7 @@ def render_live_signal_center(api_key, access_token):
                     if hist.empty:
                         raise RuntimeError("Kite returned no recent 5-minute candles. Check market-data access.")
                     hist["datetime"] = pd.to_datetime(hist["datetime"], errors="coerce")
-                    monitor = NiftyLiveMonitor(api_key, access_token, instrument_token, hist, {"body":20.0,"sl_buffer":5.0,"rr":3.5,"gap":40.0,"cutoff":"10:30"}, tg_token, tg_chat)
+                    monitor = NiftyLiveMonitor(api_key, access_token, instrument_token, hist, {"body":50.0,"sl_buffer":10.0,"rr":2.0,"gap":50.0,"cutoff":"11:00"}, tg_token, tg_chat)
                     with registry["lock"]:
                         registry["monitors"][token_key] = monitor
                 monitor.start()
@@ -1167,377 +1185,297 @@ def render_btc_quant_module():
             btc_live_panel()
     else: st.info("Live polling is off. Enable it to check completed 15-minute candles every 30 seconds while the app is open.")
 
-render_btc_quant_module()
-# ---------------- BTC PDHL UTC module ----------------
-from btc_pdhl_module import fetch_btc_5m_utc, backtest_btc_pdhl, summarize_btc_pdhl
 
-def render_btc_pdhl_module():
-    st.header("₿ BTC PDHL Baseline — UTC day")
-    st.caption("Separate 5-minute BTC PDHL research • UTC 00:00 daily boundary • Fixed 3.5R baseline • No orders")
-    with st.expander("BTC PDHL data and rules", expanded=True):
-        d1, d2 = st.columns(2)
-        with d1: pdhl_start = st.date_input("BTC PDHL history from", value=date(2020, 1, 1), key="btc_pdhl_start")
-        with d2: pdhl_end = st.date_input("BTC PDHL history to", value=date.today(), key="btc_pdhl_end")
-        st.info("UTC day runs 00:00–23:59 UTC. PDH/PDL use the previous UTC day's highest/lowest candle BODY (max/min of open and close), not wick highs/lows.")
-        st.caption("Baseline entry: signal candle closes beyond PDH/PDL; enter at next 5-minute candle open. Stop is signal candle low/high. Target defaults to 3.5R. Maximum one trade per UTC day. Positions are closed at UTC day end. If SL and target touch in the same candle, SL is counted first.")
-        if st.button("Fetch BTC 5-minute history for PDHL", type="primary", use_container_width=True, key="btc_pdhl_fetch"):
-            if pdhl_end <= pdhl_start:
-                st.error("End date must be after start date.")
+# ---------------- v3.0 unified market and strategy navigation ----------------
+st.divider()
+st.header("Research workspace")
+market_col, strategy_col = st.columns([1, 2])
+with market_col:
+    selected_market = st.selectbox("1. Select market", ["NIFTY 50", "BTC"], key="v30_market")
+with strategy_col:
+    strategy_options = (["NIFTY PDHL"] if selected_market == "NIFTY 50"
+                        else ["BTC EMA + Stoch RSI", "BTC PDHL"])
+    selected_strategy = st.selectbox("2. Select strategy", strategy_options, key="v30_strategy")
+st.caption("Choose the market and strategy here. Each strategy retains its existing data controls and parameters below.")
+# ---------------------------------------------------------------------------
+
+if selected_market == "BTC" and selected_strategy == "BTC EMA + Stoch RSI":
+    render_btc_quant_module()
+elif selected_market == "BTC" and selected_strategy == "BTC PDHL":
+    render_btc_pdhl_module()
+
+
+if selected_market == "NIFTY 50":
+    with st.expander("Kite Connect data integration", expanded=True):
+        render_kite_data_center()
+
+    api_key_live, _ = kite_credentials()
+    render_live_signal_center(api_key_live, st.session_state.get("kite_access_token"))
+
+    st.header("PDHL Strategy Settings")
+    c1,c2,c3=st.columns(3)
+    with c1: st.metric("Gap reference candle", "First 5 minutes")
+    with c2: max_trades=1; st.metric("Maximum trades per day", "1")
+    with c3: rr=st.number_input("Reward-to-risk",1.0,5.0,float(st.session_state.get("rr",2.0)),0.5,key="rr")
+    st.caption("Momentum body minimum applies only to the first breakout candle. Every entry candle must pass the directional wick filter. Two-close breakout SL uses the entry candle extreme; other setup SL uses its signal candle extreme.")
+    min_breakout_body=st.number_input("Minimum breakout / confirmation candle body (points)", min_value=5.0, max_value=300.0, value=float(st.session_state.get("min_breakout_body",50.0)), step=5.0, key="min_breakout_body", help="Applied to the first breakout candle for momentum only; if it fails, the immediately following candle may confirm with a second close and must pass the wick filter. Trap, retest and gap-reversal setups are not filtered by this setting.")
+    sl_buffer=st.number_input("Stop-loss buffer (points)",0.0,100.0,float(st.session_state.get("sl_buffer",10.0)),1.0,key="sl_buffer")
+    gap_threshold=st.number_input("Large-gap threshold (points)",10.0,200.0,float(st.session_state.get("gap_threshold",50.0)),5.0,key="gap_threshold")
+    cutoff=st.selectbox("Large-gap reversal cutoff",["10:00","10:30","11:00","11:30","12:00","12:30","13:00"],index=2,key="gap_cutoff")
+    source=st.radio("Data source",["Use downloaded Kite candles","Upload Nifty spot CSV"],horizontal=True)
+    data=None
+    if source=="Use downloaded Kite candles":
+        if "kite_nifty_candles" in st.session_state:
+            data=st.session_state["kite_nifty_candles"].copy()
+            st.success(f"Using {len(data):,} candles from Kite session.")
+        else: st.info("Download candles in the Kite Connect section above, or choose CSV upload.")
+    else:
+        f=st.file_uploader("Upload Nifty spot 5-minute CSV",type="csv")
+        if f is not None:
+            try: data=pd.read_csv(f); st.success(f"Loaded {len(data):,} rows.")
+            except Exception as e: st.error(f"CSV read error: {e}")
+    if data is not None:
+        try:
+            st.subheader("Automatic parameter research")
+            st.caption("The optimizer searches breakout body, SL buffer, target R:R, gap threshold and reversal cutoff. It selects settings on training/validation data and reports the final untouched test period separately.")
+            optimizer_min_trades=st.number_input("Minimum trades required per candidate", min_value=10, max_value=500, value=50, step=10, key="optimizer_min_trades")
+            fp=_data_fingerprint(data)
+            job_id="nql_"+fp[:24]
+            remote_ok=_remote_checkpoint_enabled()
+            if remote_ok:
+                st.success("Durable checkpoints: Supabase Storage connected.")
             else:
+                st.warning("Local checkpoint mode: browser disconnect recovery works while this app instance stays alive. For recovery after Streamlit Cloud restart/redeploy, configure Supabase Storage in Secrets (instructions in README).")
+            if st.button("Start / Resume crash-safe optimizer", type="secondary", use_container_width=True):
                 try:
-                    with st.spinner("Downloading 5-minute BTCUSD candles from Delta in batches..."):
-                        candles = fetch_btc_5m_utc(datetime.combine(pdhl_start, datetime.min.time()), datetime.combine(pdhl_end + timedelta(days=1), datetime.min.time()))
-                    if candles.empty: st.warning("Delta returned no candles for this date range.")
+                    prior=load_job_checkpoint(job_id)
+                    if prior and prior.get("fingerprint")!=fp: raise ValueError("Saved job data fingerprint does not match the current CSV. Upload the original data file.")
+                    if prior and prior.get("min_trades")!=int(optimizer_min_trades): raise ValueError("Saved job uses a different minimum-trades setting. Keep the original setting or start a fresh job.")
+                    if prior and prior.get("status")=="completed": st.info("This dataset already has a completed optimizer result. Showing the saved result below.")
                     else:
-                        st.session_state["btc_pdhl_candles"] = candles
-                        st.success(f"Downloaded {len(candles):,} 5-minute candles.")
-                except Exception as exc: st.error(f"BTC PDHL download failed: {exc}")
-        pdhl_upload = st.file_uploader("Or upload BTC 5-minute OHLC CSV", type=["csv"], key="btc_pdhl_csv")
-        if pdhl_upload is not None:
+                        resume=prior if prior and prior.get("phase") not in (None,"completed") else None
+                        save_job_checkpoint(job_id,{**(prior or {}),"status":"running","fingerprint":fp,"min_trades":int(optimizer_min_trades),"message":"Worker starting"})
+                        start_optimizer_worker(job_id,data,int(optimizer_min_trades),fp,resume)
+                        st.success("Background optimizer started. You can leave this page; the worker runs independently of the browser connection while the app process remains alive.")
+                except Exception as e: st.error(str(e))
             try:
-                uploaded_df = pd.read_csv(pdhl_upload)
-                if "datetime" not in uploaded_df.columns and "time" in uploaded_df.columns: uploaded_df = uploaded_df.rename(columns={"time": "datetime"})
-                st.session_state["btc_pdhl_candles"] = uploaded_df
-                st.success(f"Loaded {len(uploaded_df):,} BTC candles from CSV.")
-            except Exception as exc: st.error(f"CSV read error: {exc}")
-    pdhl_data = st.session_state.get("btc_pdhl_candles")
-    if pdhl_data is None or pdhl_data.empty:
-        st.info("Fetch Delta 5-minute history or upload a BTC OHLC CSV to run the PDHL baseline.")
-        return
-    st.write(f"**Dataset:** {len(pdhl_data):,} candles")
-    p1, p2, p3 = st.columns(3)
-    with p1: pdhl_rr = st.number_input("Target R:R", 1.0, 8.0, 3.5, 0.25, key="btc_pdhl_rr")
-    with p2: pdhl_max_trades = st.number_input("Maximum trades per UTC day", 1, 5, 1, key="btc_pdhl_max_trades")
-    with p3: pdhl_mode = st.selectbox("Breakout confirmation", ["Strong candle OR two closes", "Strong candle only", "Two consecutive closes only"], key="btc_pdhl_mode")
-    c1, c2 = st.columns(2)
-    with c1: pdhl_fee = st.number_input("Estimated fee (bps per side)", 0.0, 50.0, 0.0, 0.5, key="btc_pdhl_fee")
-    with c2: pdhl_slip = st.number_input("Estimated slippage (bps per side)", 0.0, 50.0, 0.0, 0.5, key="btc_pdhl_slip")
-    if st.button("Run BTC PDHL baseline backtest", type="primary", use_container_width=True, key="btc_pdhl_run"):
-        try:
-            result = backtest_btc_pdhl(pdhl_data, rr=pdhl_rr, max_trades_per_day=int(pdhl_max_trades), fee_bps_per_side=pdhl_fee, slippage_bps_per_side=pdhl_slip, confirmation=pdhl_mode)
-            st.session_state["btc_pdhl_trades"] = result
-            st.session_state["btc_pdhl_summary"] = summarize_btc_pdhl(result)
-        except Exception as exc: st.error(f"BTC PDHL backtest failed: {exc}")
-    if "btc_pdhl_trades" in st.session_state:
-        result = st.session_state["btc_pdhl_trades"]
-        summary = st.session_state["btc_pdhl_summary"]
-        st.subheader("BTC PDHL baseline results")
-        metrics = st.columns(4)
-        for col, (label, key, fmt) in zip(metrics, [("Trades", "Trades", "{:,.0f}"), ("Win rate", "Win rate %", "{:.1f}%"), ("Expectancy", "Expectancy R", "{:.3f}R"), ("Profit factor", "Profit factor", "{:.2f}")]): col.metric(label, fmt.format(summary[key]))
-        metrics2 = st.columns(3)
-        metrics2[0].metric("Total R", f"{summary['Total R']:.2f}R")
-        metrics2[1].metric("Max drawdown", f"{summary['Max drawdown R']:.2f}R")
-        metrics2[2].metric("Net P&L", f"{summary['Net points']:,.2f} BTC price points")
-        if not result.empty:
-            st.line_chart(result.assign(cumulative_R=result.R_multiple.cumsum()).set_index("exit_time")["cumulative_R"])
-            st.dataframe(result, use_container_width=True, hide_index=True)
-        else: st.warning("No qualifying BTC PDHL trades were found with these rules.")
-        st.download_button("Download BTC PDHL trades CSV", result.to_csv(index=False).encode("utf-8"), "btc_pdhl_utc_trades.csv", "text/csv", key="btc_pdhl_export")
+                job=load_job_checkpoint(job_id)
+            except Exception as e:
+                job=None; st.error(f"Could not read checkpoint: {e}")
+            if job and job.get("status") in ("running","interrupted"):
+                with _NQL_LOCK:
+                    live=_NQL_WORKERS.get(job_id)
+                    alive=bool(live and live.is_alive())
+                if not alive:
+                    try:
+                        start_optimizer_worker(job_id,data,int(optimizer_min_trades),fp,job)
+                        job=load_job_checkpoint(job_id) or job
+                        st.info("Automatic recovery: restarting the saved optimizer from its last completed parameter combination.")
+                    except Exception as recovery_error:
+                        st.error(f"Automatic recovery could not start: {recovery_error}")
+            if job:
+                pct=int(max(0,min(100,round(float(job.get("progress",0))*100))))
+                st.progress(pct,text=f"Optimizer: {pct}% — {job.get('message','')}")
+                st.caption(f"Job: {job_id} • Status: {job.get('status','unknown')} • Last saved: {job.get('updated_at','local checkpoint')}")
+                if job.get("error"): st.error(job["error"])
+                if job.get("status")=="completed" and job.get("best"):
+                    best=job["best"]; st.markdown("#### Recommended parameters")
+                    bcols=st.columns(5)
+                    for col,(label,key,suffix) in zip(bcols,[("Body minimum","body"," pts"),("SL buffer","sl"," pts"),("Target","rr","R"),("Gap threshold","gap"," pts"),("Entry cutoff","cutoff","")]): col.metric(label,f"{best[key]}{suffix}")
+                    n_train,n_valid,n_test=job.get("splits",[0,0,0])
+                    st.caption(f"Chronological split: training {n_train:,} sessions (60%), validation {n_valid:,} sessions (20%), final test {n_test:,} sessions (20%).")
+                    st.markdown("#### Validation-ranked candidates")
+                    ranked_df=pd.DataFrame(job.get("ranked",[])); st.dataframe(ranked_df,use_container_width=True,hide_index=True)
+                    st.markdown("#### Untouched final test results")
+                    test_trades_df=pd.DataFrame(job.get("test_trades",[]))
+                    st.markdown("#### Compounding capital simulation")
+                    st.caption("Risk is recalculated as a percentage of current capital before every trade. This converts spot-based R results into a hypothetical account curve; it is not actual options P&L.")
+                    cap1,cap2=st.columns(2)
+                    with cap1: initial_capital=st.number_input("Initial capital (₹)",min_value=1000.0,value=100000.0,step=5000.0,key="opt_initial_capital")
+                    with cap2: risk_pct=st.number_input("Risk per trade (% of current capital)",min_value=0.1,max_value=10.0,value=1.0,step=0.1,key="opt_risk_pct")
+                    compound_curve,final_capital=compound_capital_path(test_trades_df,initial_capital,risk_pct)
+                    if not compound_curve.empty:
+                        net_profit=final_capital-float(initial_capital)
+                        peak=compound_curve["Capital after"].cummax().clip(lower=float(initial_capital))
+                        dd_cash=compound_curve["Capital after"]-peak
+                        mdd_cash=abs(float(dd_cash.min())) if len(dd_cash) else 0.0
+                        mc=st.columns(4)
+                        mc[0].metric("Final capital",f"₹{final_capital:,.2f}")
+                        mc[1].metric("Net profit / loss",f"₹{net_profit:,.2f}",delta=f"{net_profit/float(initial_capital)*100:.2f}%")
+                        mc[2].metric("Maximum drawdown (₹)",f"₹{mdd_cash:,.2f}")
+                        mc[3].metric("Risk on first trade",f"₹{float(initial_capital)*float(risk_pct)/100:,.2f}")
+                        st.line_chart(compound_curve.set_index("Trade")["Capital after"])
+                        st.download_button("Download compounding capital trade log CSV",compound_curve.to_csv(index=False).encode(),"nql_compounding_capital.csv","text/csv")
+                    ts=job.get("test_stats",{})
+                    if ts:
+                        tcols=st.columns(4)
+                        for col,key in zip(tcols,["Trades","Total R","Average R / trade","Max drawdown (R)"]):
+                            val=ts.get(key,np.nan); col.metric(key,f"{val:.2f}" if isinstance(val,(int,float)) and np.isfinite(val) else str(val))
+                    st.download_button("Download optimizer candidate report CSV",ranked_df.to_csv(index=False).encode(),"nql_optimizer_candidates.csv","text/csv")
+                    st.download_button("Download final test trades CSV",test_trades_df.to_csv(index=False).encode(),"nql_optimizer_test_trades.csv","text/csv")
+                elif job.get("status")=="running": st.info("Optimizer is running in the background. Refresh this page to see the latest saved progress.")
+                elif job.get("status")=="interrupted": st.warning("The previous worker stopped. Press Start / Resume to continue from the last completed parameter evaluation.")
 
-render_btc_pdhl_module()
-# ---------------- End BTC PDHL UTC module ----------------
-# ---------------- End BTC Quant module ----------------
-
-with st.expander("Kite Connect data integration", expanded=True):
-    render_kite_data_center()
-
-api_key_live, _ = kite_credentials()
-render_live_signal_center(api_key_live, st.session_state.get("kite_access_token"))
-
-st.header("PDHL Strategy Settings")
-c1,c2,c3=st.columns(3)
-with c1: st.metric("Gap reference candle", "First 5 minutes")
-with c2:
-    max_trades=1
-    st.metric("Maximum trades per day", "1 (fixed)")
-with c3: rr=st.number_input("Reward-to-risk",1.0,5.0,float(st.session_state.get("rr",2.0)),0.5,key="rr")
-st.caption("Select the minimum signal/confirmation candle body size. LONG checks upper wick <= body; SHORT checks lower wick <= body. SL = signal candle extreme +/- buffer.")
-min_breakout_body=st.number_input("Minimum breakout / confirmation candle body (points)", min_value=5.0, max_value=300.0, value=float(st.session_state.get("min_breakout_body",50.0)), step=5.0, key="min_breakout_body", help="Applied to PDH/PDL momentum candle and the second candle of two-close confirmation. Trap, retest and gap-reversal setups are not filtered by this setting.")
-sl_buffer=st.number_input("Stop-loss buffer (points)",0.0,100.0,float(st.session_state.get("sl_buffer",10.0)),1.0,key="sl_buffer")
-gap_threshold=st.number_input("Large-gap threshold (points)",10.0,200.0,float(st.session_state.get("gap_threshold",50.0)),5.0,key="gap_threshold")
-cutoff=st.selectbox("Large-gap reversal cutoff",["10:00","10:30","11:00","11:30","12:00","12:30","13:00"],index=2,key="gap_cutoff")
-setup_mode = st.radio("Entry setup research mode", ["All setups (combined)", "Test one setup individually"], horizontal=True)
-if setup_mode == "Test one setup individually":
-    selected_setup = st.selectbox("Select entry setup", SETUP_NAMES, key="nql_individual_setup")
-    active_setups = [selected_setup]
-else:
-    active_setups = None
-st.caption("Each run permits exactly one trade per trading day. Individual setup runs are independent; the same date may trade in separate setup experiments.")
-st.markdown("**NIFTY data connection** — use the Kite Connect Data Center above to authenticate and download NIFTY 50 spot candles, or upload a prepared CSV.")
-source=st.radio("Data source",["Use downloaded Kite candles","Upload Nifty spot CSV"],horizontal=True)
-data=None
-if source=="Use downloaded Kite candles":
-    if "kite_nifty_candles" in st.session_state:
-        data=st.session_state["kite_nifty_candles"].copy()
-        st.success(f"Using {len(data):,} candles from Kite session.")
-    else: st.info("Download candles in the Kite Connect section above, or choose CSV upload.")
-else:
-    f=st.file_uploader("Upload Nifty spot 5-minute CSV",type="csv")
-    if f is not None:
-        try: data=pd.read_csv(f); st.success(f"Loaded {len(data):,} rows.")
-        except Exception as e: st.error(f"CSV read error: {e}")
-if data is not None:
-    try:
-        preview=prepare_spot(data)
-        preview=build_signals(preview, min_breakout_body=float(min_breakout_body), selected_setups=active_setups)
-        # Pre-backtest chart intentionally removed: chart is shown after a completed backtest only.
-        st.subheader("Automatic parameter research")
-        st.caption("The optimizer searches breakout body, SL buffer, target R:R, gap threshold and reversal cutoff. It selects settings on training/validation data and reports the final untouched test period separately.")
-        optimizer_min_trades=st.number_input("Minimum trades required per candidate", min_value=10, max_value=500, value=50, step=10, key="optimizer_min_trades")
-        fp=_data_fingerprint(data)
-        job_id="nql_"+fp[:24]
-        remote_ok=_remote_checkpoint_enabled()
-        if remote_ok:
-            st.success("Durable checkpoints: Supabase Storage connected.")
-        else:
-            st.warning("Local checkpoint mode: browser disconnect recovery works while this app instance stays alive. For recovery after Streamlit Cloud restart/redeploy, configure Supabase Storage in Secrets (instructions in README).")
-        if st.button("Start / Resume crash-safe optimizer", type="secondary", use_container_width=True):
-            try:
-                prior=load_job_checkpoint(job_id)
-                if prior and prior.get("fingerprint")!=fp: raise ValueError("Saved job data fingerprint does not match the current CSV. Upload the original data file.")
-                if prior and prior.get("min_trades")!=int(optimizer_min_trades): raise ValueError("Saved job uses a different minimum-trades setting. Keep the original setting or start a fresh job.")
-                if prior and prior.get("status")=="completed": st.info("This dataset already has a completed optimizer result. Showing the saved result below.")
+            if st.button("Run PDHL backtest",type="primary",use_container_width=True):
+                bt_progress=st.progress(0, text="Backtest progress: 0%")
+                bt_status=st.empty()
+                def backtest_progress(fraction, message):
+                    pct=int(max(0,min(100,round(fraction*100))))
+                    bt_progress.progress(pct, text=f"Backtest progress: {pct}%")
+                    bt_status.caption(message)
+                trades,equity,signals=run_backtest(data,int(max_trades),"Next candle open",float(sl_buffer),float(rr),float(min_breakout_body),float(gap_threshold),str(cutoff),progress_callback=backtest_progress)
+                bt_progress.progress(100, text="Backtest progress: 100% — complete")
+                bt_status.success("Backtest finished. Preparing performance report…")
+                if trades.empty:
+                    st.warning("No trades generated. Check data coverage and strategy conditions.")
+                    st.session_state.pop("nql_backtest_results", None)
                 else:
-                    resume=prior if prior and prior.get("phase") not in (None,"completed") else None
-                    save_job_checkpoint(job_id,{**(prior or {}),"status":"running","fingerprint":fp,"min_trades":int(optimizer_min_trades),"message":"Worker starting"})
-                    start_optimizer_worker(job_id,data,int(optimizer_min_trades),fp,resume)
-                    st.success("Background optimizer started. You can leave this page; the worker runs independently of the browser connection while the app process remains alive.")
-            except Exception as e: st.error(str(e))
-        try:
-            job=load_job_checkpoint(job_id)
-        except Exception as e:
-            job=None; st.error(f"Could not read checkpoint: {e}")
-        if job and job.get("status") in ("running","interrupted"):
-            with _NQL_LOCK:
-                live=_NQL_WORKERS.get(job_id)
-                alive=bool(live and live.is_alive())
-            if not alive:
-                try:
-                    start_optimizer_worker(job_id,data,int(optimizer_min_trades),fp,job)
-                    job=load_job_checkpoint(job_id) or job
-                    st.info("Automatic recovery: restarting the saved optimizer from its last completed parameter combination.")
-                except Exception as recovery_error:
-                    st.error(f"Automatic recovery could not start: {recovery_error}")
-        if job:
-            pct=int(max(0,min(100,round(float(job.get("progress",0))*100))))
-            st.progress(pct,text=f"Optimizer: {pct}% — {job.get('message','')}")
-            st.caption(f"Job: {job_id} • Status: {job.get('status','unknown')} • Last saved: {job.get('updated_at','local checkpoint')}")
-            if job.get("error"): st.error(job["error"])
-            if job.get("status")=="completed" and job.get("best"):
-                best=job["best"]; st.markdown("#### Recommended parameters")
-                bcols=st.columns(5)
-                for col,(label,key,suffix) in zip(bcols,[("Body minimum","body"," pts"),("SL buffer","sl"," pts"),("Target","rr","R"),("Gap threshold","gap"," pts"),("Entry cutoff","cutoff","")]): col.metric(label,f"{best[key]}{suffix}")
-                n_train,n_valid,n_test=job.get("splits",[0,0,0])
-                st.caption(f"Chronological split: training {n_train:,} sessions (60%), validation {n_valid:,} sessions (20%), final test {n_test:,} sessions (20%).")
-                st.markdown("#### Validation-ranked candidates")
-                ranked_df=pd.DataFrame(job.get("ranked",[])); st.dataframe(ranked_df,use_container_width=True,hide_index=True)
-                st.markdown("#### Untouched final test results")
-                test_trades_df=pd.DataFrame(job.get("test_trades",[]))
-                st.markdown("#### Compounding capital simulation")
-                st.caption("Risk is recalculated as a percentage of current capital before every trade. This converts spot-based R results into a hypothetical account curve; it is not actual options P&L.")
-                cap1,cap2=st.columns(2)
-                with cap1: initial_capital=st.number_input("Initial capital (₹)",min_value=1000.0,value=100000.0,step=5000.0,key="opt_initial_capital")
-                with cap2: risk_pct=st.number_input("Risk per trade (% of current capital)",min_value=0.1,max_value=10.0,value=1.0,step=0.1,key="opt_risk_pct")
-                compound_curve,final_capital=compound_capital_path(test_trades_df,initial_capital,risk_pct)
-                if not compound_curve.empty:
-                    net_profit=final_capital-float(initial_capital)
-                    peak=compound_curve["Capital after"].cummax().clip(lower=float(initial_capital))
-                    dd_cash=compound_curve["Capital after"]-peak
-                    mdd_cash=abs(float(dd_cash.min())) if len(dd_cash) else 0.0
-                    mc=st.columns(4)
-                    mc[0].metric("Final capital",f"₹{final_capital:,.2f}")
-                    mc[1].metric("Net profit / loss",f"₹{net_profit:,.2f}",delta=f"{net_profit/float(initial_capital)*100:.2f}%")
-                    mc[2].metric("Maximum drawdown (₹)",f"₹{mdd_cash:,.2f}")
-                    mc[3].metric("Risk on first trade",f"₹{float(initial_capital)*float(risk_pct)/100:,.2f}")
-                    st.line_chart(compound_curve.set_index("Trade")["Capital after"])
-                    st.download_button("Download compounding capital trade log CSV",compound_curve.to_csv(index=False).encode(),"nql_compounding_capital.csv","text/csv")
-                ts=job.get("test_stats",{})
-                if ts:
-                    tcols=st.columns(4)
-                    for col,key in zip(tcols,["Trades","Total R","Average R / trade","Max drawdown (R)"]):
-                        val=ts.get(key,np.nan); col.metric(key,f"{val:.2f}" if isinstance(val,(int,float)) and np.isfinite(val) else str(val))
-                st.download_button("Download optimizer candidate report CSV",ranked_df.to_csv(index=False).encode(),"nql_optimizer_candidates.csv","text/csv")
-                st.download_button("Download final test trades CSV",test_trades_df.to_csv(index=False).encode(),"nql_optimizer_test_trades.csv","text/csv")
-            elif job.get("status")=="running": st.info("Optimizer is running in the background. Refresh this page to see the latest saved progress.")
-            elif job.get("status")=="interrupted": st.warning("The previous worker stopped. Press Start / Resume to continue from the last completed parameter evaluation.")
+                    # Persist results across Streamlit reruns, including CSV download clicks.
+                    st.session_state["nql_backtest_results"] = {
+                        "trades": trades.copy(), "signals": signals.copy(),
+                        "data_fingerprint": fp, "created_at": datetime.now().isoformat()
+                    }
+                    st.success(f"Backtest complete: {len(trades):,} trades")
 
-        if st.button("Run PDHL backtest",type="primary",use_container_width=True):
-            bt_progress=st.progress(0, text="Backtest progress: 0%")
-            bt_status=st.empty()
-            def backtest_progress(fraction, message):
-                pct=int(max(0,min(100,round(fraction*100))))
-                bt_progress.progress(pct, text=f"Backtest progress: {pct}%")
-                bt_status.caption(message)
-            trades,equity,signals=run_backtest(data,int(max_trades),"Next candle open",float(sl_buffer),float(rr),float(min_breakout_body),float(gap_threshold),str(cutoff),progress_callback=backtest_progress,selected_setups=active_setups)
-            bt_progress.progress(100, text="Backtest progress: 100% — complete")
-            bt_status.success("Backtest finished. Preparing performance report…")
-            if trades.empty:
-                st.warning("No trades generated. Check data coverage and strategy conditions.")
-                st.session_state.pop("nql_backtest_results", None)
-            else:
-                # Persist results across Streamlit reruns, including CSV download clicks.
-                st.session_state["nql_backtest_results"] = {
-                    "trades": trades.copy(), "signals": signals.copy(),
-                    "data_fingerprint": fp, "setup_filter": active_setups or ["ALL"], "created_at": datetime.now().isoformat()
-                }
-                st.success(f"Backtest complete: {len(trades):,} trades")
-
-        saved_bt=st.session_state.get("nql_backtest_results")
-        if saved_bt is not None:
-            if saved_bt.get("data_fingerprint") != fp or saved_bt.get("setup_filter") != (active_setups or ["ALL"]):
-                st.info("A previous backtest result is saved for a different dataset. Run the backtest again to refresh the reports.")
-            else:
-                trades=saved_bt["trades"].copy()
-                signals=saved_bt["signals"].copy()
-                stats=stats_for(trades)
-                st.divider()
-                st.header("Backtest results and downloads")
-                st.subheader("Trade visualization — TradingView-style risk/reward boxes")
-                st.caption("Red zone = initial stop risk; green zone = target reward. Boxes begin at actual entry time and end at actual exit time. Values are sourced from the trade log.")
-                st.plotly_chart(
-                    build_trade_chart(data, trades, show_levels=True),
-                    use_container_width=True,
-                    key="nql_trade_boxes_chart",
-                    config={
-                        "scrollZoom": True,
-                        "doubleClick": "reset",
-                        "displaylogo": False,
-                        "displayModeBar": True,
-                        "responsive": True,
-                        "modeBarButtonsToAdd": [
-                            "pan2d", "zoom2d", "zoomIn2d", "zoomOut2d",
-                            "autoScale2d", "resetScale2d"
-                        ],
-                        "modeBarButtonsToRemove": ["toImage", "select2d", "lasso2d"],
-                    },
-                )
-                st.caption(f"Results retained for this dataset • Generated {saved_bt.get('created_at','')}")
-                cols=st.columns(4)
-                for col,(k,v) in zip(cols,list(stats.items())[:4]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
-                cols=st.columns(4)
-                for col,(k,v) in zip(cols,list(stats.items())[4:8]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
-                st.subheader("Risk-normalized performance — R multiples")
-                rcols=st.columns(3)
-                rcols[0].metric("Total R", f"{stats['Total R']:+.2f}R")
-                rcols[1].metric("Average R / trade", f"{stats['Average R / trade']:+.3f}R")
-                rcols[2].metric("Maximum drawdown", f"{stats['Max drawdown (R)']:.2f}R")
-                st.caption("1R = the initial entry-to-stop risk for that individual trade. R excludes brokerage, slippage and other costs.")
-                st.subheader("Equity curve — cumulative R")
-                st.line_chart(trades.set_index("exit_time")["cumulative_R"])
-                st.subheader("Equity curve — cumulative Nifty points")
-                st.line_chart(trades.set_index("exit_time")["cumulative_points"])
-
-                st.subheader("Compounding capital simulation")
-                st.caption("Risk is recalculated as a percentage of current capital before every trade. This is a hypothetical spot-R account simulation, not actual options P&L.")
-                cap1,cap2=st.columns(2)
-                with cap1: initial_capital=st.number_input("Initial capital (₹)",min_value=1000.0,value=100000.0,step=5000.0,key="bt_initial_capital")
-                with cap2: risk_pct=st.number_input("Risk per trade (% of current capital)",min_value=0.1,max_value=10.0,value=1.0,step=0.1,key="bt_risk_pct")
-                compound_curve,final_capital=compound_capital_path(trades,initial_capital,risk_pct)
-                if not compound_curve.empty:
-                    net_profit=final_capital-float(initial_capital)
-                    peak=compound_curve["Capital after"].cummax().clip(lower=float(initial_capital))
-                    dd_cash=compound_curve["Capital after"]-peak
-                    mdd_cash=abs(float(dd_cash.min())) if len(dd_cash) else 0.0
-                    mc=st.columns(4)
-                    mc[0].metric("Final capital",f"₹{final_capital:,.2f}")
-                    mc[1].metric("Final profit / loss",f"₹{net_profit:,.2f}",delta=f"{net_profit/float(initial_capital)*100:.2f}%")
-                    mc[2].metric("Maximum drawdown (₹)",f"₹{mdd_cash:,.2f}")
-                    mc[3].metric("First trade risk",f"₹{float(initial_capital)*float(risk_pct)/100:,.2f}")
-                    st.line_chart(compound_curve.set_index("Trade")["Capital after"])
-
-                st.subheader("Entry-type statistics")
-                def entry_type_summary(g):
-                    pnl=g["pnl_points"].astype(float); rvals=g["R_multiple"].astype(float)
-                    gross_profit=pnl[pnl>0].sum(); gross_loss=abs(pnl[pnl<0].sum())
-                    rcurve=rvals.cumsum(); rdraw=rcurve-rcurve.cummax().clip(lower=0)
-                    return pd.Series({"Trades":len(g),"Wins":int((pnl>0).sum()),"Losses":int((pnl<0).sum()),"Win rate %":(pnl>0).mean()*100,"Net points":pnl.sum(),"Expectancy points":pnl.mean(),"Profit factor":gross_profit/gross_loss if gross_loss else np.inf,"Total R":rvals.sum(),"Average R":rvals.mean(),"Max drawdown R":abs(rdraw.min()) if len(rdraw) else 0})
-                setup_stats=pd.DataFrame([{"setup":name, **entry_type_summary(group).to_dict()} for name,group in trades.groupby("setup",sort=False)])
-                st.dataframe(setup_stats,use_container_width=True,hide_index=True)
-                st.bar_chart(setup_stats.set_index("setup")[["Total R","Average R"]])
-
-                st.subheader("Monthly performance — including total R")
-                monthly_source=trades.copy()
-                monthly_source["trade_date"]=pd.to_datetime(monthly_source["trade_date"],errors="coerce")
-                monthly_source=monthly_source.dropna(subset=["trade_date"])
-                monthly_source["Year"]=monthly_source["trade_date"].dt.year
-                monthly_source["Month number"]=monthly_source["trade_date"].dt.month
-                monthly_source["Month"]=monthly_source["trade_date"].dt.strftime("%b")
-                def period_summary(g):
-                    pnl=g["pnl_points"].astype(float); rvals=g["R_multiple"].astype(float)
-                    gp=pnl[pnl>0].sum(); gl=abs(pnl[pnl<0].sum())
-                    return {"Trades":len(g),"Win rate %":(pnl>0).mean()*100,"Net points":pnl.sum(),"Expectancy points":pnl.mean(),"Profit factor":gp/gl if gl else np.inf,"Total R":rvals.sum(),"Average R":rvals.mean()}
-                monthly_rows=[]
-                for (yr,mon),grp in monthly_source.groupby(["Year","Month number"],sort=True):
-                    monthly_rows.append({"Year":int(yr),"Month number":int(mon),"Period":grp["Month"].iloc[0],**period_summary(grp)})
-                monthly_stats=pd.DataFrame(monthly_rows)
-                if not monthly_stats.empty:
-                    st.dataframe(monthly_stats,use_container_width=True,hide_index=True)
-                    st.bar_chart(monthly_stats.assign(Year_Month=monthly_stats.apply(lambda z:f"{int(z['Year'])}-{int(z['Month number']):02d}",axis=1)).set_index("Year_Month")[["Total R"]])
-                    annual_rows=[]; combined_rows=[]
-                    for yr,yr_data in monthly_source.groupby("Year",sort=True):
-                        for mon,grp in yr_data.groupby("Month number",sort=True):
-                            combined_rows.append({"Year":int(yr),"Period":grp["Month"].iloc[0],**period_summary(grp)})
-                        year_summary=period_summary(yr_data)
-                        annual_rows.append({"Year":int(yr),**year_summary})
-                        combined_rows.append({"Year":int(yr),"Period":"YEAR TOTAL",**year_summary})
-                    st.subheader("Year-wise totals")
-                    st.dataframe(pd.DataFrame(annual_rows),use_container_width=True,hide_index=True)
-                    year_end_table=pd.DataFrame(combined_rows)
-                    st.subheader("Monthly breakdown with annual total")
-                    st.dataframe(year_end_table,use_container_width=True,hide_index=True)
+            saved_bt=st.session_state.get("nql_backtest_results")
+            if saved_bt is not None:
+                if saved_bt.get("data_fingerprint") != fp:
+                    st.info("A previous backtest result is saved for a different dataset. Run the backtest again to refresh the reports.")
                 else:
-                    year_end_table=pd.DataFrame()
-                    st.warning("Trade dates could not be parsed; monthly and yearly statistics are unavailable.")
+                    trades=saved_bt["trades"].copy()
+                    signals=saved_bt["signals"].copy()
+                    stats=stats_for(trades)
+                    st.divider()
+                    st.header("Backtest results and downloads")
+                    st.caption(f"Results retained for this dataset • Generated {saved_bt.get('created_at','')}")
+                    st.subheader("TradingView-style chart with actual trade drawings")
+                    render_tradingview_chart(preview, trades=trades, chart_key="nifty_backtest_chart")
+                    cols=st.columns(4)
+                    for col,(k,v) in zip(cols,list(stats.items())[:4]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
+                    cols=st.columns(4)
+                    for col,(k,v) in zip(cols,list(stats.items())[4:8]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
+                    st.subheader("Risk-normalized performance — R multiples")
+                    rcols=st.columns(3)
+                    rcols[0].metric("Total R", f"{stats['Total R']:+.2f}R")
+                    rcols[1].metric("Average R / trade", f"{stats['Average R / trade']:+.3f}R")
+                    rcols[2].metric("Maximum drawdown", f"{stats['Max drawdown (R)']:.2f}R")
+                    st.caption("1R = the initial entry-to-stop risk for that individual trade. R excludes brokerage, slippage and other costs.")
+                    st.subheader("Equity curve — cumulative R")
+                    st.line_chart(trades.set_index("exit_time")["cumulative_R"])
+                    st.subheader("Equity curve — cumulative Nifty points")
+                    st.line_chart(trades.set_index("exit_time")["cumulative_points"])
 
-                st.divider()
-                st.header("Trailing stop-loss effectiveness")
-                st.caption("Same PDHL entries and initial risk are replayed with alternative exits. The original fixed target remains active. New trailing levels apply from the next candle, avoiding same-candle look-ahead.")
-                atr_col, swing_col = st.columns(2)
-                with atr_col: trail_atr_mult=st.number_input("ATR trailing multiplier",min_value=0.5,max_value=5.0,value=2.0,step=0.25,key="trail_atr_mult")
-                with swing_col: trail_swing=st.number_input("Swing trailing lookback (bars)",min_value=2,max_value=10,value=3,step=1,key="trail_swing_bars")
-                if st.button("Analyze trailing stop methods",type="secondary",use_container_width=True,key="run_trailing_analysis"):
-                    with st.spinner("Replaying existing PDHL trades with alternative exits…"):
-                        trail_detail,trail_summary=trailing_stop_analysis(data,trades,trail_atr_mult,int(trail_swing))
-                    st.session_state["nql_trailing_analysis"]={"detail":trail_detail,"summary":trail_summary,"fingerprint":fp}
-                saved_trail=st.session_state.get("nql_trailing_analysis")
-                if saved_trail and saved_trail.get("fingerprint")==fp:
-                    trail_summary=saved_trail["summary"]; trail_detail=saved_trail["detail"]
-                    if not trail_summary.empty:
-                        st.subheader("Exit-method comparison")
-                        st.dataframe(trail_summary,use_container_width=True,hide_index=True)
-                        st.bar_chart(trail_summary.set_index("Exit method")[["Total R","Expectancy (R)","Max drawdown (R)"]])
-                        best=trail_summary.sort_values(["Expectancy (R)","Max drawdown (R)"],ascending=[False,True]).iloc[0]
-                        st.info(f"Highest expectancy in this sample: {best['Exit method']} ({best['Expectancy (R)']:+.3f}R/trade). Confirm on an untouched out-of-sample period before choosing it.")
-                        tdl1,tdl2=st.columns(2)
-                        with tdl1: st.download_button("Download trailing comparison CSV",trail_summary.to_csv(index=False).encode(),"nql_trailing_comparison.csv","text/csv",key="dl_trail_summary")
-                        with tdl2: st.download_button("Download trailing trade details CSV",trail_detail.to_csv(index=False).encode(),"nql_trailing_trade_details.csv","text/csv",key="dl_trail_detail")
-                    else: st.warning("No trailing analysis results were generated.")
-                st.subheader("Trade log")
-                st.dataframe(trades,use_container_width=True,hide_index=True)
-                # Keep all exports visible after any Streamlit rerun.
-                dl1,dl2,dl3=st.columns(3)
-                with dl1: st.download_button("Download backtest trades CSV",trades.to_csv(index=False).encode("utf-8"),"nql_backtest_trades.csv","text/csv",key="dl_backtest_trades")
-                with dl2: st.download_button("Download monthly/yearly CSV",year_end_table.to_csv(index=False).encode("utf-8"),"nql_monthly_yearly_statistics.csv","text/csv",key="dl_backtest_monthly")
-                with dl3: st.download_button("Download compounding CSV",compound_curve.to_csv(index=False).encode("utf-8"),"nql_compounding_capital.csv","text/csv",key="dl_backtest_compound")
-                st.download_button("Download signal audit CSV",signals[signals.signal!=""].to_csv(index=False).encode("utf-8"),"nql_signal_audit.csv","text/csv",key="dl_backtest_signals")
-    except Exception as e: st.exception(e)
-else:
-    st.info("Connect Kite and download Nifty spot candles above, or upload a spot CSV to run the backtest.")
+                    st.subheader("Compounding capital simulation")
+                    st.caption("Risk is recalculated as a percentage of current capital before every trade. This is a hypothetical spot-R account simulation, not actual options P&L.")
+                    cap1,cap2=st.columns(2)
+                    with cap1: initial_capital=st.number_input("Initial capital (₹)",min_value=1000.0,value=100000.0,step=5000.0,key="bt_initial_capital")
+                    with cap2: risk_pct=st.number_input("Risk per trade (% of current capital)",min_value=0.1,max_value=10.0,value=1.0,step=0.1,key="bt_risk_pct")
+                    compound_curve,final_capital=compound_capital_path(trades,initial_capital,risk_pct)
+                    if not compound_curve.empty:
+                        net_profit=final_capital-float(initial_capital)
+                        peak=compound_curve["Capital after"].cummax().clip(lower=float(initial_capital))
+                        dd_cash=compound_curve["Capital after"]-peak
+                        mdd_cash=abs(float(dd_cash.min())) if len(dd_cash) else 0.0
+                        mc=st.columns(4)
+                        mc[0].metric("Final capital",f"₹{final_capital:,.2f}")
+                        mc[1].metric("Final profit / loss",f"₹{net_profit:,.2f}",delta=f"{net_profit/float(initial_capital)*100:.2f}%")
+                        mc[2].metric("Maximum drawdown (₹)",f"₹{mdd_cash:,.2f}")
+                        mc[3].metric("First trade risk",f"₹{float(initial_capital)*float(risk_pct)/100:,.2f}")
+                        st.line_chart(compound_curve.set_index("Trade")["Capital after"])
 
-with st.expander("v1.0 assumptions — review before interpreting results"):
-    st.markdown("""
-- PDH = highest previous-session candle body high: max(Open, Close) across its 5-minute candles.
-- PDL = lowest previous-session candle body low: min(Open, Close) across its 5-minute candles.
-- Today's open between PDH and PDL waits for a PDH/PDL breakout; no trigger means no trade.
-- Gap-up = today's open - body-based PDH; gap-down = body-based PDL - today's open.
-- A gap strictly greater than 50 points uses the first 5-minute candle body low/high as the reversal trigger; trigger must occur before 11:00 AM.
-- Gap-up reversal: SHORT after price breaks below first candle body low. Gap-down reversal: LONG after price breaks above first candle body high.
-- Gaps of 50 points or less, when the open is outside the PDH/PDL range, use the small-gap setups.
-- Entry is at the next 5-minute candle open after the signal candle closes.
-- Small-gap retest and trap definitions remain the coded assumptions shown in signal reasons; these need user validation.
-- Exactly one trade per day; earliest qualifying signal among the selected setup(s) takes priority.
-- SL uses signal candle low - buffer for LONG, high + buffer for SHORT; default buffer 10 points. Target defaults to 1:2.
-- If stop and target both touch within one candle, stop-loss is counted first (conservative).
-- Remaining open trades exit at the final candle close of that session.
-- All performance is in Nifty spot points, not options P&L or rupees. No brokerage/charges are applied.
-""")
+                    st.subheader("Entry-type statistics")
+                    def entry_type_summary(g):
+                        pnl=g["pnl_points"].astype(float); rvals=g["R_multiple"].astype(float)
+                        gross_profit=pnl[pnl>0].sum(); gross_loss=abs(pnl[pnl<0].sum())
+                        rcurve=rvals.cumsum(); rdraw=rcurve-rcurve.cummax().clip(lower=0)
+                        return pd.Series({"Trades":len(g),"Wins":int((pnl>0).sum()),"Losses":int((pnl<0).sum()),"Win rate %":(pnl>0).mean()*100,"Net points":pnl.sum(),"Expectancy points":pnl.mean(),"Profit factor":gross_profit/gross_loss if gross_loss else np.inf,"Total R":rvals.sum(),"Average R":rvals.mean(),"Max drawdown R":abs(rdraw.min()) if len(rdraw) else 0})
+                    setup_stats=pd.DataFrame([{"setup":name, **entry_type_summary(group).to_dict()} for name,group in trades.groupby("setup",sort=False)])
+                    st.dataframe(setup_stats,use_container_width=True,hide_index=True)
+                    st.bar_chart(setup_stats.set_index("setup")[["Total R","Average R"]])
+
+                    st.subheader("Monthly performance — including total R")
+                    monthly_source=trades.copy()
+                    monthly_source["trade_date"]=pd.to_datetime(monthly_source["trade_date"],errors="coerce")
+                    monthly_source=monthly_source.dropna(subset=["trade_date"])
+                    monthly_source["Year"]=monthly_source["trade_date"].dt.year
+                    monthly_source["Month number"]=monthly_source["trade_date"].dt.month
+                    monthly_source["Month"]=monthly_source["trade_date"].dt.strftime("%b")
+                    def period_summary(g):
+                        pnl=g["pnl_points"].astype(float); rvals=g["R_multiple"].astype(float)
+                        gp=pnl[pnl>0].sum(); gl=abs(pnl[pnl<0].sum())
+                        return {"Trades":len(g),"Win rate %":(pnl>0).mean()*100,"Net points":pnl.sum(),"Expectancy points":pnl.mean(),"Profit factor":gp/gl if gl else np.inf,"Total R":rvals.sum(),"Average R":rvals.mean()}
+                    monthly_rows=[]
+                    for (yr,mon),grp in monthly_source.groupby(["Year","Month number"],sort=True):
+                        monthly_rows.append({"Year":int(yr),"Month number":int(mon),"Period":grp["Month"].iloc[0],**period_summary(grp)})
+                    monthly_stats=pd.DataFrame(monthly_rows)
+                    if not monthly_stats.empty:
+                        st.dataframe(monthly_stats,use_container_width=True,hide_index=True)
+                        st.bar_chart(monthly_stats.assign(Year_Month=monthly_stats.apply(lambda z:f"{int(z['Year'])}-{int(z['Month number']):02d}",axis=1)).set_index("Year_Month")[["Total R"]])
+                        annual_rows=[]; combined_rows=[]
+                        for yr,yr_data in monthly_source.groupby("Year",sort=True):
+                            for mon,grp in yr_data.groupby("Month number",sort=True):
+                                combined_rows.append({"Year":int(yr),"Period":grp["Month"].iloc[0],**period_summary(grp)})
+                            year_summary=period_summary(yr_data)
+                            annual_rows.append({"Year":int(yr),**year_summary})
+                            combined_rows.append({"Year":int(yr),"Period":"YEAR TOTAL",**year_summary})
+                        st.subheader("Year-wise totals")
+                        st.dataframe(pd.DataFrame(annual_rows),use_container_width=True,hide_index=True)
+                        year_end_table=pd.DataFrame(combined_rows)
+                        st.subheader("Monthly breakdown with annual total")
+                        st.dataframe(year_end_table,use_container_width=True,hide_index=True)
+                    else:
+                        year_end_table=pd.DataFrame()
+                        st.warning("Trade dates could not be parsed; monthly and yearly statistics are unavailable.")
+
+                    st.divider()
+                    st.header("Trailing stop-loss effectiveness")
+                    st.caption("Same PDHL entries and initial risk are replayed with alternative exits. The original fixed target remains active. New trailing levels apply from the next candle, avoiding same-candle look-ahead.")
+                    atr_col, swing_col = st.columns(2)
+                    with atr_col: trail_atr_mult=st.number_input("ATR trailing multiplier",min_value=0.5,max_value=5.0,value=2.0,step=0.25,key="trail_atr_mult")
+                    with swing_col: trail_swing=st.number_input("Swing trailing lookback (bars)",min_value=2,max_value=10,value=3,step=1,key="trail_swing_bars")
+                    if st.button("Analyze trailing stop methods",type="secondary",use_container_width=True,key="run_trailing_analysis"):
+                        with st.spinner("Replaying existing PDHL trades with alternative exits…"):
+                            trail_detail,trail_summary=trailing_stop_analysis(data,trades,trail_atr_mult,int(trail_swing))
+                        st.session_state["nql_trailing_analysis"]={"detail":trail_detail,"summary":trail_summary,"fingerprint":fp}
+                    saved_trail=st.session_state.get("nql_trailing_analysis")
+                    if saved_trail and saved_trail.get("fingerprint")==fp:
+                        trail_summary=saved_trail["summary"]; trail_detail=saved_trail["detail"]
+                        if not trail_summary.empty:
+                            st.subheader("Exit-method comparison")
+                            st.dataframe(trail_summary,use_container_width=True,hide_index=True)
+                            st.bar_chart(trail_summary.set_index("Exit method")[["Total R","Expectancy (R)","Max drawdown (R)"]])
+                            best=trail_summary.sort_values(["Expectancy (R)","Max drawdown (R)"],ascending=[False,True]).iloc[0]
+                            st.info(f"Highest expectancy in this sample: {best['Exit method']} ({best['Expectancy (R)']:+.3f}R/trade). Confirm on an untouched out-of-sample period before choosing it.")
+                            tdl1,tdl2=st.columns(2)
+                            with tdl1: st.download_button("Download trailing comparison CSV",trail_summary.to_csv(index=False).encode(),"nql_trailing_comparison.csv","text/csv",key="dl_trail_summary")
+                            with tdl2: st.download_button("Download trailing trade details CSV",trail_detail.to_csv(index=False).encode(),"nql_trailing_trade_details.csv","text/csv",key="dl_trail_detail")
+                        else: st.warning("No trailing analysis results were generated.")
+                    st.subheader("Trade log")
+                    st.dataframe(trades,use_container_width=True,hide_index=True)
+                    # Keep all exports visible after any Streamlit rerun.
+                    dl1,dl2,dl3=st.columns(3)
+                    with dl1: st.download_button("Download backtest trades CSV",trades.to_csv(index=False).encode("utf-8"),"nql_backtest_trades.csv","text/csv",key="dl_backtest_trades")
+                    with dl2: st.download_button("Download monthly/yearly CSV",year_end_table.to_csv(index=False).encode("utf-8"),"nql_monthly_yearly_statistics.csv","text/csv",key="dl_backtest_monthly")
+                    with dl3: st.download_button("Download compounding CSV",compound_curve.to_csv(index=False).encode("utf-8"),"nql_compounding_capital.csv","text/csv",key="dl_backtest_compound")
+                    st.download_button("Download signal audit CSV",signals[signals.signal!=""].to_csv(index=False).encode("utf-8"),"nql_signal_audit.csv","text/csv",key="dl_backtest_signals")
+        except Exception as e: st.exception(e)
+    else:
+        st.info("Connect Kite and download Nifty spot candles above, or upload a spot CSV to run the backtest.")
+
+    with st.expander("v1.0 assumptions — review before interpreting results"):
+        st.markdown("""
+    - PDH = highest previous-session candle body high: max(Open, Close) across its 5-minute candles.
+    - PDL = lowest previous-session candle body low: min(Open, Close) across its 5-minute candles.
+    - Today's open between PDH and PDL waits for a PDH/PDL breakout; no trigger means no trade.
+    - Gap-up = today's open - body-based PDH; gap-down = body-based PDL - today's open.
+    - A gap greater than or equal to 50 points is classified as large, using opening candle body low/high relative to PDH/PDL; reversal requires a later candle CLOSE beyond that body edge before 11:00 AM.
+    - Gap-up reversal: SHORT only after a later candle closes below first candle body low. Gap-down reversal: LONG only after a later candle closes above first candle body high. Wick-only breaks do not qualify.
+    - Gaps of 50 points or less, when the open is outside the PDH/PDL range, use the small-gap setups.
+    - Entry is at the next 5-minute candle open after the signal candle closes.
+    - PDH trap: previous candle closes above PDH, then current candle closes below PDH, only if PDH breakout entry has not activated. PDL trap is mirrored.
+    - One trade per day by default; earliest qualifying signal takes priority.
+    - Two-close breakout SL uses the second confirmation (entry) candle low - buffer for LONG, or high + buffer for SHORT; execution is at the following candle open. Other setups use their signal candle extreme plus/minus buffer. Default buffer 10 points; target defaults to 1:2.
+    - If stop and target both touch within one candle, stop-loss is counted first (conservative).
+    - Remaining open trades exit at the final candle close of that session.
+    - All performance is in Nifty spot points, not options P&L or rupees. No brokerage/charges are applied.
+    """)
