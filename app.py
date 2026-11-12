@@ -1349,7 +1349,7 @@ if selected_market == "NIFTY 50":
                     st.header("Backtest results and downloads")
                     st.caption(f"Results retained for this dataset • Generated {saved_bt.get('created_at','')}")
                     st.subheader("TradingView-style chart with actual trade drawings")
-                    render_tradingview_chart(preview, trades=trades, chart_key="nifty_backtest_chart")
+                    render_tradingview_chart(signals, trades=trades, chart_key="nifty_backtest_chart")
                     cols=st.columns(4)
                     for col,(k,v) in zip(cols,list(stats.items())[:4]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
                     cols=st.columns(4)
