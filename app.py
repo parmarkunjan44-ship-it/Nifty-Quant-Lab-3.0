@@ -1472,12 +1472,18 @@ if selected_market == "NIFTY 50":
                     st.divider()
                     st.header("Backtest results and downloads")
                     st.caption(f"Results retained for this dataset • Generated {saved_bt.get('created_at','')}")
-                    st.subheader("TradingView-style chart with actual trade drawings")
-                    render_tradingview_chart(signals, trades=trades, chart_key="nifty_backtest_chart")
+                    # Render statistics independently so a chart/UI error cannot hide the report.
                     cols=st.columns(4)
                     for col,(k,v) in zip(cols,list(stats.items())[:4]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
                     cols=st.columns(4)
                     for col,(k,v) in zip(cols,list(stats.items())[4:8]): col.metric(k, f"{v:.2f}" if isinstance(v,(float,np.floating)) and np.isfinite(v) else str(v))
+
+                    st.subheader("TradingView-style chart with actual trade drawings")
+                    try:
+                        render_tradingview_chart(signals, trades=trades, chart_key="nifty_backtest_chart")
+                    except Exception as chart_error:
+                        st.error("Chart could not be rendered, but backtest statistics and reports are still available.")
+                        st.exception(chart_error)
                     st.subheader("Risk-normalized performance — R multiples")
                     rcols=st.columns(3)
                     rcols[0].metric("Total R", f"{stats['Total R']:+.2f}R")
