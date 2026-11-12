@@ -16,9 +16,8 @@ KITE_LOGIN_ROOT = "https://kite.zerodha.com/connect/login"
 
 
 def render_tradingview_chart(candles, trades=None, chart_key="nifty_chart", max_candles=None):
-    """Interactive OHLC chart: one-day initial view, historical pan, date jump and trade details."""
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+    'Mobile-first Lightweight Charts view with axis drag zoom and touch pan/pinch.'
+    import streamlit.components.v1 as components
 
     d = candles.copy()
     d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
@@ -27,194 +26,133 @@ def render_tradingview_chart(candles, trades=None, chart_key="nifty_chart", max_
         st.warning("No valid OHLC candles are available for the chart.")
         return
 
-    # Keep date navigation based on the full candle history, but render only a compact
-    # five-session window around the selected date. This reduces mobile browser work
-    # without changing any backtest calculations or stored candle data.
     trading_dates = sorted(pd.Series(d["datetime"].dt.date.unique()).tolist())
-    latest_day = trading_dates[-1]
-    earliest_day = trading_dates[0]
-
-    # Direct date navigation. If a non-trading date is selected, use the nearest prior session.
+    latest_day, earliest_day = trading_dates[-1], trading_dates[0]
     selected_day = st.date_input(
-        "Go to date",
-        value=latest_day,
-        min_value=earliest_day,
-        max_value=latest_day,
+        "Go to date", value=latest_day, min_value=earliest_day, max_value=latest_day,
         key=f"{chart_key}_goto_date",
-        help="Select a trading date to open that session. You can then drag the chart left to inspect earlier sessions."
+        help="Choose a trading date. Drag the chart to inspect nearby sessions."
     )
     available = [day for day in trading_dates if day <= selected_day]
     if not available:
         selected_day = earliest_day
-        st.info(f"No candles exist on the selected date. Showing the first available session: {selected_day}.")
     elif selected_day not in trading_dates:
         selected_day = available[-1]
-        st.info(f"No candles exist on that date. Showing the previous trading session: {selected_day}.")
+        st.info(f"No candles on that date. Showing previous session: {selected_day}.")
 
     selected_index = trading_dates.index(selected_day)
     window_dates = set(trading_dates[max(0, selected_index - 4):selected_index + 1])
     d = d[d["datetime"].dt.date.isin(window_dates)].copy()
-    window_start = pd.Timestamp(min(window_dates)).replace(hour=9, minute=0)
-    day_start = pd.Timestamp(selected_day).replace(hour=9, minute=15)
-    day_end = pd.Timestamp(selected_day).replace(hour=15, minute=30)
+    d = d.drop_duplicates("datetime", keep="last")
 
-    fig = make_subplots(rows=1, cols=1, shared_xaxes=True, vertical_spacing=0.025,
-                        specs=[[{"secondary_y": False}]])
-    up = "#26a69a"
-    down = "#ef5350"
+    # Lightweight Charts expects Unix seconds and numeric OHLC values.
+    def to_epoch_ist(value):
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("Asia/Kolkata")
+        else:
+            ts = ts.tz_convert("Asia/Kolkata")
+        return int(ts.timestamp())
 
-    fig.add_trace(go.Candlestick(
-        x=d.datetime, open=d.open, high=d.high, low=d.low, close=d.close,
-        name="NIFTY 50", increasing_line_color=up, increasing_fillcolor=up,
-        decreasing_line_color=down, decreasing_fillcolor=down, whiskerwidth=0.55,
-        hovertemplate=(
-            "<b>%{x|%d-%b-%Y %H:%M}</b><br>"
-            "O: %{open:.2f}<br>H: %{high:.2f}<br>"
-            "L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"
-        )
-    ), row=1, col=1)
+    candle_rows = []
+    for row in d.itertuples(index=False):
+        candle_rows.append({
+            "time": to_epoch_ist(row.datetime),
+            "open": float(row.open), "high": float(row.high),
+            "low": float(row.low), "close": float(row.close)
+        })
 
-    # Previous-day body levels.
-    for col, label, color in [("pdh", "PDH", "#f0b90b"), ("pdl", "PDL", "#42a5f5")]:
-        if col in d.columns and d[col].notna().any():
-            level = float(d[col].dropna().iloc[-1])
-            fig.add_hline(y=level, line_dash="solid", line_width=1, line_color=color,
-                          annotation_text=f"{label} {level:.2f}",
-                          annotation_position="right", row=1, col=1)
-
-    trade_records = []
+    trade_rows = []
+    markers = []
     if trades is not None and len(trades):
         t = pd.DataFrame(trades).copy()
         t["entry_time"] = pd.to_datetime(t["entry_time"], errors="coerce")
         t["exit_time"] = pd.to_datetime(t["exit_time"], errors="coerce")
-        visible_start, visible_end = d.datetime.min(), d.datetime.max()
-        t = t[(t.entry_time >= visible_start) & (t.entry_time <= visible_end) &
-              (t.exit_time >= window_start)]
-
+        left, right = d.datetime.min(), d.datetime.max()
+        t = t[(t.entry_time >= left) & (t.entry_time <= right) & (t.exit_time >= left)]
         for n, tr in t.reset_index(drop=True).iterrows():
             if pd.isna(tr.entry_time) or pd.isna(tr.exit_time):
                 continue
-            long_trade = str(tr.get("direction", "LONG")).upper() == "LONG"
-            entry = float(tr.entry)
-            stop = float(tr.stop)
-            target = float(tr.target)
+            entry_ts, exit_ts = to_epoch_ist(tr.entry_time), to_epoch_ist(tr.exit_time)
+            entry = float(tr.get("entry", np.nan))
+            stop = float(tr.get("stop", np.nan))
+            target = float(tr.get("target", np.nan))
             exit_price = float(tr.get("exit", np.nan))
-            x0, x1 = tr.entry_time, tr.exit_time
-            profit_low, profit_high = (entry, target) if long_trade else (target, entry)
-            risk_low, risk_high = (stop, entry) if long_trade else (entry, stop)
-
-            fig.add_shape(type="rect", x0=x0, x1=x1, y0=profit_low, y1=profit_high,
-                fillcolor="rgba(38,166,154,0.18)",
-                line=dict(color="rgba(38,166,154,0.75)", width=1), row=1, col=1)
-            fig.add_shape(type="rect", x0=x0, x1=x1, y0=risk_low, y1=risk_high,
-                fillcolor="rgba(239,83,80,0.18)",
-                line=dict(color="rgba(239,83,80,0.75)", width=1), row=1, col=1)
-            fig.add_shape(type="line", x0=x0, x1=x1, y0=entry, y1=entry,
-                line=dict(color="#e5e7eb", width=1.2, dash="dot"), row=1, col=1)
-
-            r_mult = float(tr.get("R_multiple", 0) or 0)
+            direction = str(tr.get("direction", "LONG")).upper()
             setup = str(tr.get("setup", ""))
-            direction = str(tr.get("direction", ""))
+            r_mult = float(tr.get("R_multiple", 0) or 0)
             trade_no = n + 1
-            # A selectable marker sits on the entry point; selecting it reveals full trade details.
-            fig.add_trace(go.Scatter(
-                x=[x0], y=[entry], mode="markers+text",
-                marker=dict(size=13, symbol="diamond",
-                            color="#f5f5f5", line=dict(color="#111827", width=1)),
-                text=[f"T{trade_no}"], textposition="top center",
-                name=f"Trade {trade_no}",
-                customdata=[[trade_no, setup, direction, entry, stop, target, exit_price, r_mult]],
-                hovertemplate=(
-                    f"<b>Trade {trade_no}</b><br>{setup}<br>{direction}<br>"
-                    f"Entry: {entry:.2f}<br>SL: {stop:.2f}<br>"
-                    f"Target: {target:.2f}<br>Exit: {exit_price:.2f}<br>"
-                    f"Result: {r_mult:+.2f}R<extra>Tap/select marker for details</extra>"
-                ),
-                showlegend=False
-            ), row=1, col=1)
+            trade_rows.append({"n": trade_no, "entry_time": entry_ts, "exit_time": exit_ts,
+                               "entry": entry, "stop": stop, "target": target,
+                               "exit": exit_price, "direction": direction,
+                               "setup": setup, "r": r_mult})
+            markers.append({"time": entry_ts, "position": "belowBar" if direction == "LONG" else "aboveBar",
+                            "color": "#e5e7eb", "shape": "diamond", "text": f"T{trade_no}",
+                            "size": 2})
 
-            trade_records.append({
-                "trade_no": trade_no, "setup": setup, "direction": direction,
-                "entry_time": tr.entry_time, "exit_time": tr.exit_time,
-                "entry": entry, "stop": stop, "target": target,
-                "exit": exit_price, "r_multiple": r_mult
-            })
+    candles_json = json.dumps(candle_rows, separators=(",", ":"))
+    trades_json = json.dumps(trade_rows, separators=(",", ":"))
+    markers_json = json.dumps(markers, separators=(",", ":"))
+    pdh = float(d["pdh"].dropna().iloc[-1]) if "pdh" in d.columns and d["pdh"].notna().any() else None
+    pdl = float(d["pdl"].dropna().iloc[-1]) if "pdl" in d.columns and d["pdl"].notna().any() else None
+    levels_json = json.dumps({"pdh": pdh, "pdl": pdl})
 
-    fig.update_layout(
-        template="plotly_dark", height=680, autosize=True,
-        margin=dict(l=12, r=78, t=48, b=22),
-        paper_bgcolor="#131722", plot_bgcolor="#131722",
-        font=dict(family="Arial, sans-serif", size=11, color="#d1d4dc"),
-        hovermode="x unified",
-        hoverlabel=dict(bgcolor="#202632", bordercolor="#687080",
-                        font=dict(color="#ffffff", size=12), align="left"),
-        clickmode="event+select",
-        dragmode="pan",
-        uirevision=f"{chart_key}_{selected_day}",
-        showlegend=False
-    )
-    fig.update_xaxes(
-        showgrid=True, gridcolor="rgba(42,46,57,0.8)",
-        rangeslider_visible=False, showspikes=True, spikemode="across",
-        spikesnap="cursor", spikecolor="#aeb4c0", spikethickness=1,
-        range=[day_start, day_end],
-        rangebreaks=[dict(bounds=[15.5, 9.25], pattern="hour"),
-                     dict(bounds=[6, 0], pattern="day of week")]
-    )
-    fig.update_yaxes(
-        side="right", showgrid=True, gridcolor="rgba(42,46,57,0.8)",
-        zeroline=False, fixedrange=False, automargin=True
-    )
-    fig.update_xaxes(title_text="Time (IST)")
-
-    chart_event = st.plotly_chart(
-        fig, use_container_width=True,
-        config={
-            "responsive": True,
-            "scrollZoom": False,
-            "doubleClick": "reset",
-            "displaylogo": False,
-            "modeBarButtonsToAdd": [
-                "pan2d", "zoomIn2d", "zoomOut2d", "autoscale2d", "resetScale2d",
-                "drawline", "drawrect", "eraseshape"
-            ],
-            "toImageButtonOptions": {
-                "format": "png", "filename": "nifty_tradingview_style_chart", "scale": 2
-            }
-        },
-        key=chart_key,
-        on_select="rerun",
-        selection_mode="points"
-    )
-
-    # Show selected trade's full risk/reward values below the chart.
-    selected_trade_no = None
-    try:
-        selected_points = chart_event.selection.points
-        if selected_points:
-            custom = selected_points[-1].get("customdata")
-            if custom:
-                selected_trade_no = int(custom[0])
-    except Exception:
-        selected_trade_no = None
-
-    if selected_trade_no is not None:
-        chosen = next((r for r in trade_records if r["trade_no"] == selected_trade_no), None)
-        if chosen:
-            st.markdown(f"**Trade {chosen['trade_no']} — {chosen['setup']} ({chosen['direction']})**")
-            detail_cols = st.columns(5)
-            detail_cols[0].metric("Entry", f"{chosen['entry']:.2f}")
-            detail_cols[1].metric("Stop Loss", f"{chosen['stop']:.2f}")
-            detail_cols[2].metric("Target", f"{chosen['target']:.2f}")
-            detail_cols[3].metric("Exit", f"{chosen['exit']:.2f}")
-            detail_cols[4].metric("Result", f"{chosen['r_multiple']:+.2f}R")
-            st.caption(
-                f"Entry time: {chosen['entry_time']} | Exit time: {chosen['exit_time']} | "
-                f"Risk: {abs(chosen['entry'] - chosen['stop']):.2f} points | "
-                f"Reward: {abs(chosen['target'] - chosen['entry']):.2f} points"
-            )
-    else:
-        st.caption("Tip: Tap/select a T-number diamond marker on a trade box to display Entry, Stop Loss, Target, Exit and R result below the chart.")
+    html = r'''<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <script src="https://unpkg.com/lightweight-charts@4.2.2/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+      *{box-sizing:border-box} html,body{margin:0;padding:0;background:#131722;color:#d1d4dc;font-family:Arial,sans-serif;overflow:hidden}
+      #wrap{width:100%;height:610px;position:relative;background:#131722} #chart{width:100%;height:100%;touch-action:pan-x pan-y}
+      #tip{position:absolute;z-index:5;left:8px;top:8px;padding:7px 9px;border-radius:5px;background:rgba(24,28,38,.94);font-size:11px;line-height:1.5;pointer-events:none;white-space:pre-line}
+      #hint{position:absolute;bottom:5px;left:8px;color:#9298a5;font-size:10px;pointer-events:none}
+      @media(max-width:600px){#wrap{height:540px}#tip{font-size:10px}}
+    </style></head><body><div id="wrap"><div id="chart"></div><div id="tip">Loading chart…</div><div id="hint">Axis drag = zoom • Chart drag = pan • Two fingers = pinch zoom</div></div>
+    <script>
+    const candles=__CANDLES__, trades=__TRADES__, markers=__MARKERS__, levels=__LEVELS__;
+    const root=document.getElementById('chart'), tip=document.getElementById('tip');
+    function fail(msg){tip.textContent=msg;}
+    if(!window.LightweightCharts){fail('Chart library could not load. Check internet/CDN access.');}
+    else if(!candles.length){fail('No candles in selected date window.');}
+    else {
+      const chart=LightweightCharts.createChart(root,{
+        width:root.clientWidth,height:root.clientHeight,
+        layout:{background:{type:'solid',color:'#131722'},textColor:'#d1d4dc',fontSize:11},
+        grid:{vertLines:{color:'#252a36'},horzLines:{color:'#252a36'}},
+        rightPriceScale:{borderColor:'#48515f',scaleMargins:{top:.08,bottom:.12}},
+        timeScale:{borderColor:'#48515f',timeVisible:true,secondsVisible:false,rightOffset:4},
+        crosshair:{mode:LightweightCharts.CrosshairMode.Normal},
+        handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:true},
+        handleScale:{axisPressedMouseMove:{time:true,price:true},axisDoubleClickReset:true,mouseWheel:false,pinch:true}
+      });
+      const series=chart.addCandlestickSeries({upColor:'#26a69a',downColor:'#ef5350',borderUpColor:'#26a69a',borderDownColor:'#ef5350',wickUpColor:'#26a69a',wickDownColor:'#ef5350'});
+      series.setData(candles);
+      if(markers.length){markers.sort((a,b)=>a.time-b.time);series.setMarkers(markers);}
+      if(levels.pdh!==null) series.createPriceLine({price:levels.pdh,color:'#f0b90b',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'PDH'});
+      if(levels.pdl!==null) series.createPriceLine({price:levels.pdl,color:'#42a5f5',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'PDL'});
+      // Each trade keeps its entry, stop and target drawings as short line segments over its life.
+      trades.forEach(t=>{
+        const seg=(price,color,style)=>{
+          if(Number.isFinite(price)){
+            const line=chart.addLineSeries({color,lineWidth:1,lineStyle:style,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false});
+            line.setData([{time:t.entry_time,value:price},{time:t.exit_time,value:price}]);
+          }
+        };
+        seg(t.entry,'#e5e7eb',2); seg(t.stop,'#ef5350',0); seg(t.target,'#26a69a',0);
+      });
+      chart.timeScale().fitContent();
+      chart.subscribeCrosshairMove(param=>{
+        if(!param || !param.time || !param.seriesData || !param.seriesData.get(series)){tip.textContent='';return;}
+        const c=param.seriesData.get(series);
+        const dt=new Date(param.time*1000);
+        tip.textContent=dt.toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})+
+          '\nO '+c.open.toFixed(2)+'  H '+c.high.toFixed(2)+'\nL '+c.low.toFixed(2)+'  C '+c.close.toFixed(2);
+      });
+      const resize=()=>chart.applyOptions({width:root.clientWidth,height:root.clientHeight});
+      if(window.ResizeObserver){new ResizeObserver(resize).observe(root);}else{window.addEventListener('resize',resize);}
+    }
+    </script></body></html>'''
+    html = html.replace("__CANDLES__", candles_json).replace("__TRADES__", trades_json).replace("__MARKERS__", markers_json).replace("__LEVELS__", levels_json)
+    components.html(html, height=620, scrolling=False)
+    st.caption("Mobile controls: drag chart to pan • drag price axis to vertical-zoom • drag time axis to horizontal-zoom • two-finger pinch to zoom. Trade entry markers and entry/SL/target lines are shown.")
 
 
 def compound_capital_path(trades, initial_capital, risk_pct):
