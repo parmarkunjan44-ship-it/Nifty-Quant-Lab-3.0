@@ -15,78 +15,202 @@ KITE_LOGIN_ROOT = "https://kite.zerodha.com/connect/login"
 
 
 
-def render_tradingview_chart(candles, trades=None, chart_key="nifty_chart", max_candles=2500):
-    """TradingView-inspired interactive OHLC chart; source OHLC/timestamps are never altered."""
+def render_tradingview_chart(candles, trades=None, chart_key="nifty_chart", max_candles=None):
+    """Interactive OHLC chart: one-day initial view, historical pan, date jump and trade details."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     d = candles.copy()
     d["datetime"] = pd.to_datetime(d["datetime"], errors="coerce")
     d = d.dropna(subset=["datetime", "open", "high", "low", "close"]).sort_values("datetime")
-    if len(d) > max_candles:
-        st.info(f"Chart preview is limited to the latest {max_candles:,} candles for browser performance. Backtest still uses the full dataset.")
-        d = d.tail(max_candles).copy()
-    # Price-only chart: volume bars are intentionally omitted.
-    rows = 1
+    if d.empty:
+        st.warning("No valid OHLC candles are available for the chart.")
+        return
+
+    # Keep the complete history available for left/right panning.
+    if max_candles is not None and len(d) > int(max_candles):
+        st.info("Chart history is limited by the configured candle cap; backtest calculations still use the full dataset.")
+        d = d.tail(int(max_candles)).copy()
+
+    trading_dates = sorted(pd.Series(d["datetime"].dt.date.unique()).tolist())
+    latest_day = trading_dates[-1]
+    earliest_day = trading_dates[0]
+
+    # Direct date navigation. If a non-trading date is selected, use the nearest prior session.
+    selected_day = st.date_input(
+        "Go to date",
+        value=latest_day,
+        min_value=earliest_day,
+        max_value=latest_day,
+        key=f"{chart_key}_goto_date",
+        help="Select a trading date to open that session. You can then drag the chart left to inspect earlier sessions."
+    )
+    available = [day for day in trading_dates if day <= selected_day]
+    if not available:
+        selected_day = earliest_day
+        st.info(f"No candles exist on the selected date. Showing the first available session: {selected_day}.")
+    elif selected_day not in trading_dates:
+        selected_day = available[-1]
+        st.info(f"No candles exist on that date. Showing the previous trading session: {selected_day}.")
+
+    day_start = pd.Timestamp(selected_day).replace(hour=9, minute=15)
+    day_end = pd.Timestamp(selected_day).replace(hour=15, minute=30)
+
     fig = make_subplots(rows=1, cols=1, shared_xaxes=True, vertical_spacing=0.025,
                         specs=[[{"secondary_y": False}]])
-    up = "#26a69a"; down = "#ef5350"
-    fig.add_trace(go.Candlestick(x=d.datetime, open=d.open, high=d.high, low=d.low, close=d.close,
+    up = "#26a69a"
+    down = "#ef5350"
+
+    fig.add_trace(go.Candlestick(
+        x=d.datetime, open=d.open, high=d.high, low=d.low, close=d.close,
         name="NIFTY 50", increasing_line_color=up, increasing_fillcolor=up,
-        decreasing_line_color=down, decreasing_fillcolor=down, whiskerwidth=0.55), row=1, col=1)
-    # Previous-day body levels from the signal engine, when available.
+        decreasing_line_color=down, decreasing_fillcolor=down, whiskerwidth=0.55,
+        hovertemplate=(
+            "<b>%{x|%d-%b-%Y %H:%M}</b><br>"
+            "O: %{open:.2f}<br>H: %{high:.2f}<br>"
+            "L: %{low:.2f}<br>C: %{close:.2f}<extra></extra>"
+        )
+    ), row=1, col=1)
+
+    # Previous-day body levels.
     for col, label, color in [("pdh", "PDH", "#f0b90b"), ("pdl", "PDL", "#42a5f5")]:
         if col in d.columns and d[col].notna().any():
             level = float(d[col].dropna().iloc[-1])
             fig.add_hline(y=level, line_dash="solid", line_width=1, line_color=color,
-                          annotation_text=f"{label} {level:.2f}", annotation_position="right", row=1, col=1)
-    # TradingView-position-tool style boxes from the actual backtest trade records.
+                          annotation_text=f"{label} {level:.2f}",
+                          annotation_position="right", row=1, col=1)
+
+    trade_records = []
     if trades is not None and len(trades):
         t = pd.DataFrame(trades).copy()
         t["entry_time"] = pd.to_datetime(t["entry_time"], errors="coerce")
         t["exit_time"] = pd.to_datetime(t["exit_time"], errors="coerce")
         visible_start, visible_end = d.datetime.min(), d.datetime.max()
         t = t[(t.entry_time >= visible_start) & (t.entry_time <= visible_end)]
+
         for n, tr in t.reset_index(drop=True).iterrows():
             if pd.isna(tr.entry_time) or pd.isna(tr.exit_time):
                 continue
             long_trade = str(tr.get("direction", "LONG")).upper() == "LONG"
-            entry, stop, target = float(tr.entry), float(tr.stop), float(tr.target)
+            entry = float(tr.entry)
+            stop = float(tr.stop)
+            target = float(tr.target)
+            exit_price = float(tr.get("exit", np.nan))
             x0, x1 = tr.entry_time, tr.exit_time
-            # Profit zone and risk zone use the same green/red convention as TradingView.
             profit_low, profit_high = (entry, target) if long_trade else (target, entry)
             risk_low, risk_high = (stop, entry) if long_trade else (entry, stop)
+
             fig.add_shape(type="rect", x0=x0, x1=x1, y0=profit_low, y1=profit_high,
-                fillcolor="rgba(38,166,154,0.18)", line=dict(color="rgba(38,166,154,0.75)", width=1), row=1, col=1)
+                fillcolor="rgba(38,166,154,0.18)",
+                line=dict(color="rgba(38,166,154,0.75)", width=1), row=1, col=1)
             fig.add_shape(type="rect", x0=x0, x1=x1, y0=risk_low, y1=risk_high,
-                fillcolor="rgba(239,83,80,0.18)", line=dict(color="rgba(239,83,80,0.75)", width=1), row=1, col=1)
+                fillcolor="rgba(239,83,80,0.18)",
+                line=dict(color="rgba(239,83,80,0.75)", width=1), row=1, col=1)
             fig.add_shape(type="line", x0=x0, x1=x1, y0=entry, y1=entry,
                 line=dict(color="#e5e7eb", width=1.2, dash="dot"), row=1, col=1)
-            fig.add_trace(go.Scatter(x=[x1], y=[float(tr.exit)], mode="markers+text",
-                marker=dict(size=7, color=up if float(tr.get("R_multiple", 0)) >= 0 else down),
-                text=[f"T{n+1} {float(tr.get('R_multiple', 0)):+.2f}R"], textposition="top center",
-                name=f"Trade {n+1}", showlegend=False,
-                hovertemplate=(f"Trade {n+1}<br>{tr.get('setup','')}<br>{tr.get('direction','')}<br>"
-                               f"Entry: {entry:.2f}<br>SL: {stop:.2f}<br>Target: {target:.2f}<br>"
-                               f"Exit: {float(tr.exit):.2f}<br>Result: {float(tr.get('R_multiple',0)):+.2f}R<extra></extra>")), row=1, col=1)
-    fig.update_layout(template="plotly_dark", height=680, autosize=True,
-        margin=dict(l=12, r=72, t=38, b=18), paper_bgcolor="#131722", plot_bgcolor="#131722",
+
+            r_mult = float(tr.get("R_multiple", 0) or 0)
+            setup = str(tr.get("setup", ""))
+            direction = str(tr.get("direction", ""))
+            trade_no = n + 1
+            # A selectable marker sits on the entry point; selecting it reveals full trade details.
+            fig.add_trace(go.Scatter(
+                x=[x0], y=[entry], mode="markers+text",
+                marker=dict(size=13, symbol="diamond",
+                            color="#f5f5f5", line=dict(color="#111827", width=1)),
+                text=[f"T{trade_no}"], textposition="top center",
+                name=f"Trade {trade_no}",
+                customdata=[[trade_no, setup, direction, entry, stop, target, exit_price, r_mult]],
+                hovertemplate=(
+                    f"<b>Trade {trade_no}</b><br>{setup}<br>{direction}<br>"
+                    f"Entry: {entry:.2f}<br>SL: {stop:.2f}<br>"
+                    f"Target: {target:.2f}<br>Exit: {exit_price:.2f}<br>"
+                    f"Result: {r_mult:+.2f}R<extra>Tap/select marker for details</extra>"
+                ),
+                showlegend=False
+            ), row=1, col=1)
+
+            trade_records.append({
+                "trade_no": trade_no, "setup": setup, "direction": direction,
+                "entry_time": tr.entry_time, "exit_time": tr.exit_time,
+                "entry": entry, "stop": stop, "target": target,
+                "exit": exit_price, "r_multiple": r_mult
+            })
+
+    fig.update_layout(
+        template="plotly_dark", height=680, autosize=True,
+        margin=dict(l=12, r=78, t=48, b=22),
+        paper_bgcolor="#131722", plot_bgcolor="#131722",
         font=dict(family="Arial, sans-serif", size=11, color="#d1d4dc"),
-        xaxis_rangeslider_visible=False, hovermode="x unified",
-        legend=dict(orientation="h", y=1.02, x=0),
-        dragmode="pan", uirevision=chart_key)
-    fig.update_xaxes(showgrid=True, gridcolor="rgba(42,46,57,0.8)",
-        rangeslider_visible=False, showspikes=True, spikemode="across", spikesnap="cursor",
-        spikecolor="#787b86", spikethickness=1,
-        rangebreaks=[dict(bounds=[15.5, 9.25], pattern="hour"), dict(bounds=[6, 0], pattern="day of week")])
-    fig.update_yaxes(side="right", showgrid=True, gridcolor="rgba(42,46,57,0.8)",
-        zeroline=False, fixedrange=False, row=1, col=1)
-    fig.update_xaxes(title_text="Time (IST)", row=rows, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={
-        "responsive": True, "scrollZoom": True, "displaylogo": False,
-        "modeBarButtonsToAdd": ["drawline", "drawrect", "eraseshape"],
-        "toImageButtonOptions": {"format": "png", "filename": "nifty_tradingview_style_chart", "scale": 2}
-    }, key=chart_key)
+        hovermode="x unified",
+        hoverlabel=dict(bgcolor="#202632", bordercolor="#687080",
+                        font=dict(color="#ffffff", size=12), align="left"),
+        clickmode="event+select",
+        dragmode="pan",
+        uirevision=f"{chart_key}_{selected_day}",
+        showlegend=False
+    )
+    fig.update_xaxes(
+        showgrid=True, gridcolor="rgba(42,46,57,0.8)",
+        rangeslider_visible=False, showspikes=True, spikemode="across",
+        spikesnap="cursor", spikecolor="#aeb4c0", spikethickness=1,
+        range=[day_start, day_end],
+        rangebreaks=[dict(bounds=[15.5, 9.25], pattern="hour"),
+                     dict(bounds=[6, 0], pattern="day of week")]
+    )
+    fig.update_yaxes(
+        side="right", showgrid=True, gridcolor="rgba(42,46,57,0.8)",
+        zeroline=False, fixedrange=False, automargin=True
+    )
+    fig.update_xaxes(title_text="Time (IST)")
+
+    chart_event = st.plotly_chart(
+        fig, use_container_width=True,
+        config={
+            "responsive": True,
+            "scrollZoom": True,
+            "displaylogo": False,
+            "modeBarButtonsToAdd": [
+                "pan2d", "zoomIn2d", "zoomOut2d", "autoscale2d", "resetScale2d",
+                "drawline", "drawrect", "eraseshape"
+            ],
+            "toImageButtonOptions": {
+                "format": "png", "filename": "nifty_tradingview_style_chart", "scale": 2
+            }
+        },
+        key=chart_key,
+        on_select="rerun",
+        selection_mode="points"
+    )
+
+    # Show selected trade's full risk/reward values below the chart.
+    selected_trade_no = None
+    try:
+        selected_points = chart_event.selection.points
+        if selected_points:
+            custom = selected_points[-1].get("customdata")
+            if custom:
+                selected_trade_no = int(custom[0])
+    except Exception:
+        selected_trade_no = None
+
+    if selected_trade_no is not None:
+        chosen = next((r for r in trade_records if r["trade_no"] == selected_trade_no), None)
+        if chosen:
+            st.markdown(f"**Trade {chosen['trade_no']} — {chosen['setup']} ({chosen['direction']})**")
+            detail_cols = st.columns(5)
+            detail_cols[0].metric("Entry", f"{chosen['entry']:.2f}")
+            detail_cols[1].metric("Stop Loss", f"{chosen['stop']:.2f}")
+            detail_cols[2].metric("Target", f"{chosen['target']:.2f}")
+            detail_cols[3].metric("Exit", f"{chosen['exit']:.2f}")
+            detail_cols[4].metric("Result", f"{chosen['r_multiple']:+.2f}R")
+            st.caption(
+                f"Entry time: {chosen['entry_time']} | Exit time: {chosen['exit_time']} | "
+                f"Risk: {abs(chosen['entry'] - chosen['stop']):.2f} points | "
+                f"Reward: {abs(chosen['target'] - chosen['entry']):.2f} points"
+            )
+    else:
+        st.caption("Tip: Tap/select a T-number diamond marker on a trade box to display Entry, Stop Loss, Target, Exit and R result below the chart.")
 
 
 def compound_capital_path(trades, initial_capital, risk_pct):
