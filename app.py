@@ -253,6 +253,220 @@ def archive_pdhl_backtest_to_drive(trades, signals, params, stats, created_at):
 
 
 
+
+
+def _drive_list_pdhl_runs(service, pdhl_folder_id, page_size=100):
+    """Return archived PDHL run folders, newest first."""
+    q = f"'{pdhl_folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    response = service.files().list(
+        q=q, orderBy="name desc", pageSize=page_size,
+        fields="files(id,name,modifiedTime)"
+    ).execute()
+    return response.get("files", [])
+
+
+def _drive_read_file_bytes(service, folder_id, filename):
+    """Download one named file from a saved run folder."""
+    q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
+    found = service.files().list(q=q, fields="files(id,name)", pageSize=5).execute().get("files", [])
+    if not found:
+        return None
+    request = service.files().get_media(fileId=found[0]["id"])
+    from io import BytesIO
+    buff = BytesIO()
+    from googleapiclient.http import MediaIoBaseDownload
+    downloader = MediaIoBaseDownload(buff, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buff.getvalue()
+
+
+def _load_pdhl_run_from_drive(service, run_folder):
+    """Load the complete saved backtest package needed to reproduce its report/chart."""
+    from io import BytesIO
+    folder_id = run_folder["id"]
+    trades_raw = _drive_read_file_bytes(service, folder_id, "trades.csv")
+    signals_raw = _drive_read_file_bytes(service, folder_id, "signals.csv")
+    if trades_raw is None or signals_raw is None:
+        raise FileNotFoundError("This archive is missing trades.csv or signals.csv.")
+    trades = pd.read_csv(BytesIO(trades_raw))
+    signals = pd.read_csv(BytesIO(signals_raw))
+    for col in ("entry_time", "exit_time", "signal_time", "signal_candle_time",
+                "entry_candle_time", "sl_reference_candle_time"):
+        if col in trades.columns:
+            trades[col] = pd.to_datetime(trades[col], errors="coerce")
+    if "datetime" in signals.columns:
+        signals["datetime"] = pd.to_datetime(signals["datetime"], errors="coerce")
+    summary_raw = _drive_read_file_bytes(service, folder_id, "summary.json")
+    params_raw = _drive_read_file_bytes(service, folder_id, "parameters.json")
+    summary = json.loads(summary_raw.decode("utf-8")) if summary_raw else {}
+    params = json.loads(params_raw.decode("utf-8")) if params_raw else {}
+    return {"trades": trades, "signals": signals, "summary": summary,
+            "params": params, "run_id": run_folder["name"],
+            "modified": run_folder.get("modifiedTime", "")}
+
+
+def render_saved_backtest_report(saved, key_prefix="saved_bt"):
+    """Render archived results using the same report sections and chart data as a fresh run."""
+    trades = saved["trades"].copy()
+    signals = saved["signals"].copy()
+    if trades.empty:
+        st.warning("This saved run contains no trades.")
+        return
+
+    stats = stats_for(trades)
+    st.caption(f"Run: {saved['run_id']} • Drive modified: {saved.get('modified','')}")
+    params = saved.get("params", {})
+    if params:
+        with st.expander("Saved strategy parameters", expanded=True):
+            st.json(params)
+
+    st.subheader("TradingView-style chart with actual trade drawings")
+    render_tradingview_chart(signals, trades=trades, chart_key=f"{key_prefix}_{saved['run_id'][-10:]}")
+
+    cols = st.columns(4)
+    for col, (k, v) in zip(cols, list(stats.items())[:4]):
+        col.metric(k, f"{v:.2f}" if isinstance(v, (float, np.floating)) and np.isfinite(v) else str(v))
+    cols = st.columns(4)
+    for col, (k, v) in zip(cols, list(stats.items())[4:8]):
+        col.metric(k, f"{v:.2f}" if isinstance(v, (float, np.floating)) and np.isfinite(v) else str(v))
+
+    st.subheader("Risk-normalized performance — R multiples")
+    rcols = st.columns(3)
+    rcols[0].metric("Total R", f"{stats['Total R']:+.2f}R")
+    rcols[1].metric("Average R / trade", f"{stats['Average R / trade']:+.3f}R")
+    rcols[2].metric("Maximum drawdown", f"{stats['Max drawdown (R)']:.2f}R")
+    st.caption("1R = initial entry-to-stop risk for that individual trade. R excludes brokerage, slippage and other costs.")
+
+    st.subheader("Equity curve — cumulative R")
+    if "cumulative_R" in trades.columns:
+        st.line_chart(trades.set_index("exit_time")["cumulative_R"])
+    st.subheader("Equity curve — cumulative Nifty points")
+    if "cumulative_points" in trades.columns:
+        st.line_chart(trades.set_index("exit_time")["cumulative_points"])
+
+    st.subheader("Compounding capital simulation")
+    st.caption("Risk is recalculated as a percentage of current capital before every trade. This is a hypothetical spot-R account simulation, not actual options P&L.")
+    cap1, cap2 = st.columns(2)
+    with cap1:
+        initial_capital = st.number_input("Initial capital (₹)", min_value=1000.0, value=100000.0,
+                                          step=5000.0, key=f"{key_prefix}_capital")
+    with cap2:
+        risk_pct = st.number_input("Risk per trade (% of current capital)", min_value=0.1, max_value=10.0,
+                                   value=1.0, step=0.1, key=f"{key_prefix}_risk")
+    compound_curve, final_capital = compound_capital_path(trades, initial_capital, risk_pct)
+    if not compound_curve.empty:
+        net_profit = final_capital - float(initial_capital)
+        peak = compound_curve["Capital after"].cummax().clip(lower=float(initial_capital))
+        mdd_cash = abs(float((compound_curve["Capital after"] - peak).min()))
+        mc = st.columns(4)
+        mc[0].metric("Final capital", f"₹{final_capital:,.2f}")
+        mc[1].metric("Final profit / loss", f"₹{net_profit:,.2f}",
+                     delta=f"{net_profit / float(initial_capital) * 100:.2f}%")
+        mc[2].metric("Maximum drawdown (₹)", f"₹{mdd_cash:,.2f}")
+        mc[3].metric("First trade risk", f"₹{float(initial_capital) * float(risk_pct) / 100:,.2f}")
+        st.line_chart(compound_curve.set_index("Trade")["Capital after"])
+
+    st.subheader("Entry-type statistics")
+    def entry_type_summary(group):
+        pnl = group["pnl_points"].astype(float)
+        rvals = group["R_multiple"].astype(float)
+        gross_profit = pnl[pnl > 0].sum()
+        gross_loss = abs(pnl[pnl < 0].sum())
+        rcurve = rvals.cumsum()
+        rdraw = rcurve - rcurve.cummax().clip(lower=0)
+        return pd.Series({
+            "Trades": len(group), "Wins": int((pnl > 0).sum()), "Losses": int((pnl < 0).sum()),
+            "Win rate %": (pnl > 0).mean() * 100, "Net points": pnl.sum(),
+            "Expectancy points": pnl.mean(),
+            "Profit factor": gross_profit / gross_loss if gross_loss else np.inf,
+            "Total R": rvals.sum(), "Average R": rvals.mean(),
+            "Max drawdown R": abs(rdraw.min()) if len(rdraw) else 0
+        })
+    setup_stats = pd.DataFrame([
+        {"setup": name, **entry_type_summary(group).to_dict()}
+        for name, group in trades.groupby("setup", sort=False)
+    ])
+    st.dataframe(setup_stats, use_container_width=True, hide_index=True)
+    st.bar_chart(setup_stats.set_index("setup")[["Total R", "Average R"]])
+
+    st.subheader("Monthly performance — including total R")
+    monthly_source = trades.copy()
+    monthly_source["trade_date"] = pd.to_datetime(monthly_source["trade_date"], errors="coerce")
+    monthly_source = monthly_source.dropna(subset=["trade_date"])
+    monthly_source["Year"] = monthly_source["trade_date"].dt.year
+    monthly_source["Month number"] = monthly_source["trade_date"].dt.month
+    monthly_source["Month"] = monthly_source["trade_date"].dt.strftime("%b")
+
+    def period_summary(group):
+        pnl = group["pnl_points"].astype(float)
+        rvals = group["R_multiple"].astype(float)
+        gp, gl = pnl[pnl > 0].sum(), abs(pnl[pnl < 0].sum())
+        return {"Trades": len(group), "Win rate %": (pnl > 0).mean() * 100,
+                "Net points": pnl.sum(), "Expectancy points": pnl.mean(),
+                "Profit factor": gp / gl if gl else np.inf,
+                "Total R": rvals.sum(), "Average R": rvals.mean()}
+
+    monthly_rows = []
+    for (year, month), group in monthly_source.groupby(["Year", "Month number"], sort=True):
+        monthly_rows.append({"Year": int(year), "Month number": int(month),
+                             "Period": group["Month"].iloc[0], **period_summary(group)})
+    monthly_stats = pd.DataFrame(monthly_rows)
+    year_end_table = pd.DataFrame()
+    if not monthly_stats.empty:
+        st.dataframe(monthly_stats, use_container_width=True, hide_index=True)
+        st.bar_chart(monthly_stats.assign(
+            Year_Month=monthly_stats.apply(lambda z: f"{int(z['Year'])}-{int(z['Month number']):02d}", axis=1)
+        ).set_index("Year_Month")[["Total R"]])
+        annual_rows, combined_rows = [], []
+        for year, year_data in monthly_source.groupby("Year", sort=True):
+            for month, group in year_data.groupby("Month number", sort=True):
+                combined_rows.append({"Year": int(year), "Period": group["Month"].iloc[0], **period_summary(group)})
+            annual = period_summary(year_data)
+            annual_rows.append({"Year": int(year), **annual})
+            combined_rows.append({"Year": int(year), "Period": "YEAR TOTAL", **annual})
+        st.subheader("Year-wise totals")
+        st.dataframe(pd.DataFrame(annual_rows), use_container_width=True, hide_index=True)
+        year_end_table = pd.DataFrame(combined_rows)
+        st.subheader("Monthly breakdown with annual total")
+        st.dataframe(year_end_table, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.header("Trailing stop-loss effectiveness")
+    st.caption("Same saved entries and initial risk are replayed with alternative exits. Original fixed target remains active.")
+    trail_a, trail_s = st.columns(2)
+    with trail_a:
+        atr_mult = st.number_input("ATR trailing multiplier", 0.5, 5.0, 2.0, 0.25, key=f"{key_prefix}_atr")
+    with trail_s:
+        swing_lookback = st.number_input("Swing trailing lookback (bars)", 2, 10, 3, 1, key=f"{key_prefix}_swing")
+    if st.button("Analyze trailing stop methods", key=f"{key_prefix}_run_trailing", use_container_width=True):
+        detail, summary = trailing_stop_analysis(signals, trades, atr_mult, int(swing_lookback))
+        st.session_state[f"{key_prefix}_trail"] = {"detail": detail, "summary": summary}
+    trail_saved = st.session_state.get(f"{key_prefix}_trail")
+    if trail_saved and not trail_saved["summary"].empty:
+        st.subheader("Exit-method comparison")
+        st.dataframe(trail_saved["summary"], use_container_width=True, hide_index=True)
+        st.bar_chart(trail_saved["summary"].set_index("Exit method")[["Total R", "Expectancy (R)", "Max drawdown (R)"]])
+        best = trail_saved["summary"].sort_values(["Expectancy (R)", "Max drawdown (R)"], ascending=[False, True]).iloc[0]
+        st.info(f"Highest expectancy in this sample: {best['Exit method']} ({best['Expectancy (R)']:+.3f}R/trade).")
+
+    st.subheader("Trade log")
+    st.dataframe(trades, use_container_width=True, hide_index=True)
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.download_button("Download saved trades CSV", trades.to_csv(index=False).encode("utf-8"),
+                           f"{saved['run_id']}_trades.csv", "text/csv", key=f"{key_prefix}_dl_trades")
+    with d2:
+        st.download_button("Download saved signals CSV", signals.to_csv(index=False).encode("utf-8"),
+                           f"{saved['run_id']}_signals.csv", "text/csv", key=f"{key_prefix}_dl_signals")
+    with d3:
+        st.download_button("Download monthly/yearly CSV", year_end_table.to_csv(index=False).encode("utf-8"),
+                           f"{saved['run_id']}_monthly.csv", "text/csv", key=f"{key_prefix}_dl_monthly")
+    st.download_button("Download compounding CSV", compound_curve.to_csv(index=False).encode("utf-8"),
+                       f"{saved['run_id']}_compounding.csv", "text/csv", key=f"{key_prefix}_dl_compound")
+
+
 def render_tradingview_chart(candles, trades=None, chart_key="nifty_chart", max_candles=None):
     'Mobile-first Lightweight Charts view with axis drag zoom and touch pan/pinch.'
     import streamlit.components.v1 as components
@@ -1809,6 +2023,37 @@ elif selected_market == "BTC" and selected_strategy == "BTC PDHL":
 
 
 if selected_market == "NIFTY 50":
+    with st.expander("Saved Backtests — Google Drive archive", expanded=False):
+        st.caption("Open a previous PDHL run with its original candles, trade drawings, full statistics, monthly reports and downloads.")
+        if st.button("Refresh saved backtests", key="refresh_saved_pdhl_runs"):
+            st.session_state.pop("saved_pdhl_runs_cache", None)
+            st.session_state.pop("selected_saved_pdhl_run", None)
+        service, drive_error = _google_drive_service()
+        if service is None:
+            st.warning("Google Drive is not connected: " + str(drive_error))
+        else:
+            try:
+                root_id = str(st.secrets["google_drive"]["folder_id"]).strip()
+                pdhl_id = _drive_folder_id(service, root_id, "PDHL")
+                runs = _drive_list_pdhl_runs(service, pdhl_id)
+                if not runs:
+                    st.info("No archived PDHL runs were found in the configured Google Drive folder.")
+                else:
+                    run_labels = [f"{r['name']} • {r.get('modifiedTime', '')}" for r in runs]
+                    selected_label = st.selectbox("Select saved backtest", run_labels, key="saved_pdhl_run_select")
+                    selected_run = runs[run_labels.index(selected_label)]
+                    if st.button("Load selected backtest", type="primary", use_container_width=True,
+                                 key="load_saved_pdhl_run"):
+                        with st.spinner("Fetching saved trades, signals and report data from Google Drive…"):
+                            loaded = _load_pdhl_run_from_drive(service, selected_run)
+                            st.session_state["selected_saved_pdhl_run"] = loaded
+                    loaded = st.session_state.get("selected_saved_pdhl_run")
+                    if loaded and loaded.get("run_id") == selected_run["name"]:
+                        st.divider()
+                        render_saved_backtest_report(loaded, key_prefix="saved_pdhl")
+            except Exception as archive_error:
+                st.error(f"Could not retrieve saved backtests: {type(archive_error).__name__}: {archive_error}")
+
     with st.expander("Kite Connect data integration", expanded=False):
         render_kite_data_center()
 
